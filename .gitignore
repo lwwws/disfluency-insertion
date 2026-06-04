@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.egg-info/
+untarget.egg-info/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Data and generated outputs
+/data/
+outputs/
+runs/
+checkpoints/
+wandb/
+mlruns/
+
+# Model weights / artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDEs / editors
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Project-local notes
+CLAUDE.md
