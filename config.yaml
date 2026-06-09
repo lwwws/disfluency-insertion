@@ -1,5 +1,12 @@
 # Configuration
 
+# LLM model identifiers
 models:
   L2.7-B-Chat: "meta-llama/Llama-2-7b-chat-hf"
   Flan-T5-L: "google/flan-t5-large"
+
+# Text-to-Speech model identifiers
+tts:
+  bark: "bark"
+  tortoise: "tortoise"
+  openai: "gpt-4o-mini-tts"

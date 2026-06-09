@@ -287,9 +287,7 @@ class BaseDisfluencyModel(ABC):
 	) -> Any:
 		"""Fine-tune the model using a prepared dataset.
 
-		Note: data tokenization/formatting is intentionally expected to be done
-		by a separate dataloader module. ``train_dataset`` and ``eval_dataset``
-		must be ready to be consumed by ``transformers.Trainer``.
+		Data tokenization/formatting is expected to be done by the dataloader file.
 		"""
 		self._ensure_loaded()
 		_ensure_dependencies()
@@ -303,7 +301,7 @@ class BaseDisfluencyModel(ABC):
 			warmup_steps=warmup_steps,
 			logging_steps=logging_steps,
 			save_strategy=save_strategy,
-			evaluation_strategy="epoch" if eval_dataset is not None else "no",
+			eval_strategy="epoch" if eval_dataset is not None else "no",
 			remove_unused_columns=False,
 			report_to=[],
 			**training_kwargs,
