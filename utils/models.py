@@ -87,24 +87,23 @@ class BaseDisfluencyModel(ABC):
 	"""
 
 	def __init__(
-		self,
-		model_name: str,
-		model_id: Optional[str] = None,
-		task_type: Optional[str] = None,
-		config_path: Optional[str] = None,
-		system_prompt: str = (
-			"You are an expert assistant that rewrites fluent text into natural "
-			"disfluent speech while preserving meaning."
-		),
-		auto_load: bool = False,
-		load_in_4bit: bool = False,
-		load_in_8bit: bool = False,
-		device_map: Optional[str] = None,
-		torch_dtype: Any = None,
+			self,
+			model_name: str,
+			model_id: Optional[str] = None,
+			task_type: Optional[str] = None,
+			config_path: Optional[str] = None,
+			system_prompt: str = (
+					"You are an expert assistant that rewrites fluent text into natural "
+					"disfluent speech while preserving meaning."
+			),
+			auto_load: bool = False,
+			load_in_4bit: bool = False,
+			load_in_8bit: bool = False,
+			device_map: Optional[str] = None,
+			torch_dtype: Any = None,
 	) -> None:
 		self.model_name = model_name
-		self.model_id = model_id
-		self.task_type = task_type
+		self.model_id = model_id or model_name  # Fallback if not provided
 		self.config_path = config_path
 		self.system_prompt = system_prompt
 		self.auto_load = auto_load
@@ -120,10 +119,8 @@ class BaseDisfluencyModel(ABC):
 		self._peft_enabled = False
 		self._peft_config: Optional[dict] = None
 
-		registry = _load_model_registry(Path(self.config_path) if self.config_path else None)
-		resolved_id = self.model_id or registry.get(self.model_name) or self.model_name
-		self.model_id = resolved_id
-		self.task_type = _infer_task_type(self.model_name, resolved_id, self.task_type)
+		# If the task type wasn't explicitly provided by a factory, infer it as a last resort
+		self.task_type = task_type or _infer_task_type(self.model_name, self.model_id)
 
 		if self.auto_load:
 			self.load()
@@ -131,13 +128,28 @@ class BaseDisfluencyModel(ABC):
 	@classmethod
 	def from_config(cls, model_key: str, **kwargs: Any) -> "BaseDisfluencyModel":
 		"""Factory: choose the correct concrete subclass based on model metadata."""
-
 		registry = _load_model_registry(Path(kwargs.get("config_path") or ""))
 		model_id = kwargs.get("model_id") or registry.get(model_key) or model_key
-		task = _infer_task_type(model_key, model_id, kwargs.get("task_type"))
+		task = _infer_task_type(model_name=model_key, model_id=model_id, explicit_task=kwargs.get("task_type"))
+
 		if task == "seq2seq":
-			return Seq2SeqDisfluencyModel(model_key, **kwargs)
-		return CausalDisfluencyModel(model_key, **kwargs)
+			return Seq2SeqDisfluencyModel(model_name=model_key, model_id=model_id, task_type=task, **kwargs)
+		return CausalDisfluencyModel(model_name=model_key, model_id=model_id, task_type=task, **kwargs)
+
+	@classmethod
+	def from_pretrained(cls, model_path: str, **kwargs: Any) -> "BaseDisfluencyModel":
+		"""Factory: instantiate directly from a Hugging Face path or local directory.
+
+        Bypasses config.yaml completely.
+        Example: model = BaseDisfluencyModel.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+        """
+		# Extract task type if provided, otherwise infer it
+		explicit_task = kwargs.pop("task_type", None)
+		task = _infer_task_type(model_name=model_path, model_id=model_path, explicit_task=explicit_task)
+
+		if task == "seq2seq":
+			return Seq2SeqDisfluencyModel(model_name=model_path, model_id=model_path, task_type=task, **kwargs)
+		return CausalDisfluencyModel(model_name=model_path, model_id=model_path, task_type=task, **kwargs)
 
 	@property
 	def is_loaded(self) -> bool:
