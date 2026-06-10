@@ -7,6 +7,12 @@ models:
 
 # Text-to-Speech model identifiers
 tts:
-  bark: "bark"
-  tortoise: "tortoise"
-  openai: "gpt-4o-mini-tts"
+  open_source:
+    bark: "bark"
+    tortoise: "tortoise"
+    parler: "parler-tts/parler_tts_mini_v0.1"
+    chattts: "chattts"
+  closed_source:
+    openai: "gpt-4o-mini-tts"
+    cartesia: "sonic-3.5"
+    elevenlabs: "eleven_monolingual_v1"
