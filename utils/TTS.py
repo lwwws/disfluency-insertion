@@ -71,7 +71,15 @@ class BaseTTS(ABC):
     def __init__(self, model_key: str, model_id: Optional[str] = None, device: Optional[str] = None):
         self.model_key = model_key
         self.model_id = model_id
-        self.device = device or ("cuda" if _np is not None else "cpu")
+        self.device = device or self._default_device()
+
+    @staticmethod
+    def _default_device() -> str:
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
 
     @abstractmethod
     def synthesize(self, text: str, **kwargs: Any) -> Tuple["_np.ndarray", int]:
@@ -99,6 +107,31 @@ class BaseTTS(ABC):
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm.tobytes())
+
+    def synthesize_to_file(self, text: str, path: str, **kwargs: Any) -> str:
+        """Synthesize text and save it as an audio file."""
+        audio, sample_rate = self.synthesize(text, **kwargs)
+        self.save(audio, sample_rate, path)
+        return path
+
+    def sample_speaker(self) -> Optional[str]:
+        """Return a reusable speaker/voice token when the backend supports it."""
+        return None
+
+
+def prepare_text_for_tts(text: str, backend: str = "chattts") -> str:
+    """Convert dataset markers into backend-friendly speech/pause markers.
+
+    The dataset uses <sil> for silent pauses. ChatTTS has explicit pause tokens;
+    Bark tends to respond better to ellipses for hesitation-like pauses.
+    """
+    cleaned = " ".join(str(text).split())
+    backend = backend.lower()
+    if "chattts" in backend:
+        return cleaned.replace("<sil>", "[uv_break]")
+    if "bark" in backend:
+        return cleaned.replace("<sil>", "...")
+    return cleaned.replace("<sil>", "...")
 
 
 class BarkTTS(BaseTTS):
@@ -224,17 +257,29 @@ class ChatTTS(BaseTTS):
     def __init__(self, model_key: str, model_id: Optional[str] = None, device: Optional[str] = None):
         super().__init__(model_key, model_id, device)
         self.chat = None
+        self._chat_module = None
         try:
             import ChatTTS as _ChatTTS
+            self._chat_module = _ChatTTS
             self.chat = _ChatTTS.Chat()
             self.chat.load(compile=False)
         except ImportError:
             pass
 
+    def sample_speaker(self) -> Optional[str]:
+        if self.chat is None:
+            raise ImportError("ChatTTS is required to sample a speaker")
+        return self.chat.sample_random_speaker()
+
     def synthesize(self, text: str, **kwargs: Any) -> Tuple["_np.ndarray", int]:
         if self.chat is None or _np is None:
             raise ImportError("ChatTTS and numpy are required")
 
+        speaker = kwargs.pop("speaker", None) or kwargs.pop("spk_emb", None)
+        if speaker is not None and "params_infer_code" not in kwargs:
+            kwargs["params_infer_code"] = self._chat_module.Chat.InferCodeParams(spk_emb=speaker)
+
+        text = prepare_text_for_tts(text, "chattts")
         wavs = self.chat.infer([text], **kwargs)
         return wavs[0], 24000
 
