@@ -45,6 +45,9 @@ from datasets import Dataset, DatasetDict
 from tqdm import tqdm
 import pandas as pd
 
+import random
+from collections import defaultdict
+
 NITE = "{http://nite.sourceforge.net/}"
 
 
@@ -377,29 +380,85 @@ class SwbdDisfluencyDataset:
                       f"<{cfg.min_agreement} (skipped enrichment): {sum(a < cfg.min_agreement for a in ag)} | "
                       f"A/B swaps: {sum(a['swapped'] for a in self.align_report)}")
         return self
+    
+    # Shared record filtering...
+    def _iter_records(self, split=None, enriched_only=True):
+        """Single source of truth for split / enriched filtering, used by every
+        exporter so they all behave identically."""
+        for r in self.records:
+            if split is not None and r.get("split") != split:
+                continue
+            if enriched_only and not r.get("enriched", False):
+                continue
+            yield r
+
 
     # Access
     def __len__(self): return len(self.records)
     def __getitem__(self, i): return self.records[i]
-    def to_pandas(self): return pd.DataFrame(self.records)
 
-    def to_hf_dataset(self, fields=("fluent", "disfluent")):
-        """Return a HuggingFace `datasets.Dataset` with just the given fields.
+    def to_pandas(self, split=None, enriched_only=True):
+        """DataFrame of records. Pass enriched_only=False for the full raw corpus
+        (e.g. exploratory analysis)."""
+        import pandas as pd
+        return pd.DataFrame(list(self._iter_records(split, enriched_only)))
 
-        Default fields=("fluent","disfluent") gives a minimal seq2seq-ready
-        dataset. Pass fields=None to keep every record field.
-        Note: may need to extend in the future for train/val/test splits
+
+    def to_hf_dataset(self, fields=("fluent", "disfluent"), split=None, enriched_only=True):
+        """HuggingFace dataset of the chosen fields.
+    
+        fields : tuple of record keys, or None to keep every field. To include
+                context: fields=("context", "fluent", "disfluent").
+        split  : None  + splits assigned -> DatasetDict{train,val,test}
+                None  + no splits        -> single Dataset of all records
+                "train"/"val"/"test"     -> single Dataset for that split
         """
+        if fields is not None and self.records:
+            missing = [f for f in fields if f not in self.records[0]]
+            if missing:
+                raise KeyError(f"fields {missing} not on records -- did you call "
+                            f"add_context()/add_splits() first?")
+    
         def _select(r):
-            return {k: r[k] for k in fields} if fields else r
+            return dict(r) if fields is None else {f: r.get(f) for f in fields}
+    
+        def _ds(spl):
+            return Dataset.from_list([_select(r) for r in self._iter_records(spl, enriched_only)])
+    
+        if split is not None:
+            return _ds(split)
+    
+        present = []
+        for r in self.records:
+            s = r.get("split")
+            if s is not None and s not in present:
+                present.append(s)
+        if not present: # no splits assigned -> flat dataset
+            return _ds(None)
 
-        recs = [r for r in self.records]
-        return Dataset.from_list([_select(r) for r in recs])
+        order = ["train", "val", "test"]
+        ordered = [s for s in order if s in present] + [s for s in present if s not in order]
+        return DatasetDict({s: _ds(s) for s in ordered})
+
 
     def pairs(self, split=None, enriched_only=True):
         """[(fluent, disfluent)] ready for fine-tuning."""
-        return [(r["fluent"], r["disfluent"]) for r in self.records
-                if (split is None or r["split"] == split) and (not enriched_only or r["enriched"])]
+        return [(r["fluent"], r["disfluent"]) for r in self._iter_records(split, enriched_only)]
+ 
+ 
+    def context_pairs(self, split=None, enriched_only=True, sep="\n",
+                    context_template="{context}{sep}{target}"):
+        """[(input, disfluent)] where input = context + current fluent utterance.
+    
+        Falls back to the bare fluent string when a record has no context attached
+        (conversation-initial turns, or if add_context was never called)."""
+        out = []
+        for r in self._iter_records(split, enriched_only):
+            ctx = r.get("context", "")
+            inp = context_template.format(context=ctx, sep=sep, target=r["fluent"]) if ctx else r["fluent"]
+            out.append((inp, r["disfluent"]))
+        return out
+
 
     # Persistence
     def save_jsonl(self, path):
@@ -435,6 +494,120 @@ class SwbdDisfluencyDataset:
             print(f"filter_records: kept {len(kept)}/{before}")
 
         return self
+
+    def add_splits(self, ratios=(0.8, 0.1, 0.1), names=("train", "val", "test"),
+                seed=42, by="conv"):
+        """Assign each record a `split` field, splitting by `by` (default: conversation).
+    
+        Splitting by conversation (NOT by utterance) prevents leakage of speaker
+        style/topic across splits, and is REQUIRED once context is added so a test
+        utterance's previous turns can't end up in train.
+    
+        ratios : (train, val, test). Use (0.9, 0.0, 0.1) to mirror the paper's
+                90/10 train/test with no validation set. Set val>0 if you do any
+                model selection / hyperparameter tuning (recommended).
+        """
+        assert abs(sum(ratios) - 1.0) < 1e-6, "ratios must sum to 1"
+        keys = sorted({r[by] for r in self.records})
+        random.Random(seed).shuffle(keys)
+
+        n = len(keys)
+        b1 = int(round(ratios[0] * n))
+        b2 = b1 + int(round(ratios[1] * n))
+    
+        split_of = {}
+        for i, key in enumerate(keys):
+            split_of[key] = names[0] if i < b1 else names[1] if i < b2 else names[2]
+        for r in self.records:
+            r["split"] = split_of[r[by]]
+    
+        if self.cfg.verbose:
+            convs = {nm: sum(s == nm for s in split_of.values()) for nm in names}
+            recs = {nm: sum(r["split"] == nm for r in self.records) for nm in names}
+            print(f"add_splits (by {by}): convs {convs} | records {recs}")
+        return self
+ 
+ 
+    @staticmethod
+    def render_context(turns, speaker_map=None, template="{speaker}: {text}",
+                    join=" ", prefix=True):
+        """Join structured context turns into a string, the caller's way.
+    
+        turns       : list of {"speaker": str, "text": str}  (record["context_turns"])
+        speaker_map : optional {orig: new}, e.g. {"A": "Agent", "B": "Caller"}
+        template    : per-turn format; available fields are {speaker} and {text}
+        join        : separator between turns (" ", "\n", ...)
+        prefix      : False -> drop speaker labels entirely (texts only)
+        """
+        out = []
+        for t in turns:
+            spk = (speaker_map or {}).get(t["speaker"], t["speaker"])
+            out.append(template.format(speaker=spk, text=t["text"]) if prefix else t["text"])
+        return join.join(out)
+
+
+    def add_context(self, k=3, source="fluent", include_other_speaker=True,
+                    speaker_prefix=True, join=" ", template="{speaker}: {text}",
+                    speaker_map=None):
+        """Attach the previous `k` turns of the same conversation to each record.
+    
+        Stores per record:
+            context_turns   : list of {"speaker", "text"}  -- RAW, no prefix baked in;
+                            reformat freely downstream via render_context(...)
+            context         : ONE prepared string built with the args below
+                            (a convenience; override anytime from context_turns)
+            n_context_turns : how many turns were available (< k near conversation start)
+    
+        source : "fluent" (recommended) or "disfluent".
+            Use "fluent": no disfluency labels enter the input, so there's no
+            cross-datapoint label leakage and no train/deploy mismatch, and the
+            model can't copy a speaker's disfluency *rate* from context.
+            I reckon "disfluent" is leakage sensitive choice...
+    
+        include_other_speaker : True = full dialogue context (both speakers in true
+            temporal order); False = only the target speaker's own prior turns.
+    
+        Blank turns (empty after rendering) are skipped so they don't consume a
+        `k` slot, a real prior turn fills it instead.
+    
+        NOTE: call this BEFORE filter_records so short utterances remain available
+        as context. Ordering assumes `turn` is a GLOBAL conversation index
+        (increasing across both speakers) and `sent_num` orders sentences within a
+        turn.
+        """
+        assert source in ("fluent", "disfluent")
+    
+        by_conv = defaultdict(list)
+        for idx, r in enumerate(self.records):
+            by_conv[r["conv"]].append(idx)
+    
+        for conv, idxs in by_conv.items():
+            idxs.sort(key=lambda i: (self.records[i].get("turn") or 0,
+                                    self.records[i].get("sent_num") or 0))
+            for pos, i in enumerate(idxs):
+                r = self.records[i]
+                turns, j = [], pos - 1
+                while j >= 0 and len(turns) < k:
+                    pr = self.records[idxs[j]]
+                    same_or_both = include_other_speaker or pr["speaker"] == r["speaker"]
+                    if same_or_both and pr[source].strip():     # skip blank turns
+                        turns.append({"speaker": pr["speaker"], "text": pr[source]})
+                    j -= 1
+                turns.reverse()  # chronological
+    
+                r["context_turns"] = turns # raw, reformattable
+                r["n_context_turns"] = len(turns)
+                r["context"] = self.render_context( # one prepared string
+                    turns, speaker_map=speaker_map, template=template,
+                    join=join, prefix=speaker_prefix)
+    
+        if self.cfg.verbose:
+            avg = sum(r["n_context_turns"] for r in self.records) / max(len(self.records), 1)
+            print(f"add_context: k={k} source={source} "
+                f"other_speaker={include_other_speaker} | avg turns attached {avg:.2f}")
+        return self
+
+
 
 if __name__ == "__main__":
     cfg = Config()
