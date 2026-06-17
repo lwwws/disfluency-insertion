@@ -382,7 +382,7 @@ class SwbdDisfluencyDataset:
         return self
     
     # Shared record filtering...
-    def _iter_records(self, split=None, enriched_only=True):
+    def _iter_records(self, split=None, enriched_only=False):
         """Single source of truth for split / enriched filtering, used by every
         exporter so they all behave identically."""
         for r in self.records:
@@ -397,14 +397,13 @@ class SwbdDisfluencyDataset:
     def __len__(self): return len(self.records)
     def __getitem__(self, i): return self.records[i]
 
-    def to_pandas(self, split=None, enriched_only=True):
-        """DataFrame of records. Pass enriched_only=False for the full raw corpus
-        (e.g. exploratory analysis)."""
+    def to_pandas(self, split=None, enriched_only=False):
+        """DataFrame of records."""
         import pandas as pd
         return pd.DataFrame(list(self._iter_records(split, enriched_only)))
 
 
-    def to_hf_dataset(self, fields=("fluent", "disfluent"), split=None, enriched_only=True):
+    def to_hf_dataset(self, fields=("fluent", "disfluent"), split=None, enriched_only=False):
         """HuggingFace dataset of the chosen fields.
     
         fields : tuple of record keys, or None to keep every field. To include
@@ -441,12 +440,12 @@ class SwbdDisfluencyDataset:
         return DatasetDict({s: _ds(s) for s in ordered})
 
 
-    def pairs(self, split=None, enriched_only=True):
+    def pairs(self, split=None, enriched_only=False):
         """[(fluent, disfluent)] ready for fine-tuning."""
         return [(r["fluent"], r["disfluent"]) for r in self._iter_records(split, enriched_only)]
  
  
-    def context_pairs(self, split=None, enriched_only=True, sep="\n",
+    def context_pairs(self, split=None, enriched_only=False, sep="\n",
                     context_template="{context}{sep}{target}"):
         """[(input, disfluent)] where input = context + current fluent utterance.
     
