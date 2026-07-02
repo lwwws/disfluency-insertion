@@ -18,9 +18,10 @@ LoRA Configuration (from paper):
     - Target modules: ['q_proj', 'v_proj'] (model-specific)
 
 Training Configuration:
-    - Batch size: 2
-    - Gradient accumulation steps: 4
+    - Batch size: 1 (default, CLI-overridable)
+    - Gradient accumulation steps: 8 (default, CLI-overridable)
     - Learning rate: 2e-4
+    - Gradient checkpointing: enabled by default
     - Save strategy: steps (every 500 steps)
 """
 
@@ -33,6 +34,13 @@ from typing import Optional, Dict, List, Any
 import torch
 from utils.models import BaseDisfluencyModel, _load_model_registry
 from utils.swbd_disfluency_loader import SwbdDisfluencyDataset, Config as DataConfig
+import os
+
+try:
+    # prefer the modern name; huggingface_hub is a light dependency and safe to require for auth
+    from huggingface_hub import login as hf_login  # type: ignore
+except Exception:  # pragma: no cover - handled at runtime
+    hf_login = None  # type: ignore
 
 # Set up logging
 logging.basicConfig(
@@ -70,12 +78,15 @@ LORA_CONFIGS: Dict[str, Dict[str, Any]] = {
 # ================================================================================
 TRAINING_CONFIG = {
     "num_train_epochs": 3,
-    "per_device_train_batch_size": 2,
-    "gradient_accumulation_steps": 4,  # simulates batch size of 8
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 8,  # keeps effective batch size ~8 with lower VRAM
     "learning_rate": 2e-4,
     "warmup_steps": 100,
     "logging_steps": 50,
+    "gradient_checkpointing": True,
     "save_steps": 500,
+    "save_total_limit": 2,
     "save_strategy": "steps",
     "eval_strategy": "steps",
     "eval_steps": 500,
@@ -84,6 +95,13 @@ TRAINING_CONFIG = {
     "greater_is_better": False,
     "seed": 42,
 }
+
+
+def _cleanup_cuda_memory() -> None:
+    """Free GPU allocator cache between model runs to reduce fragmentation/OOMs."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 # ================================================================================
@@ -123,7 +141,7 @@ def load_disfluency_dataset(
 
     # Filter by minimum length
     logger.info(f"Filtering records with minimum length {min_len}...")
-    dataset.filter_records(by="fluent", min_len=min_len)
+    dataset.filter_records(min_tokens_fluent=min_len)
 
     # Add splits
     logger.info(f"Splitting data: train={train_ratio}, eval={eval_ratio}, test={test_ratio}...")
@@ -195,6 +213,8 @@ def train_model(
     output_dir: str,
     task_type: str,
     seed: int = 42,
+    run_name: Optional[str] = None,
+    quantization: str = "4bit",
     **training_kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -217,17 +237,36 @@ def train_model(
     logger.info(f"Training {model_key} ({model_id})")
     logger.info(f"{'='*80}")
 
-    output_path = Path(output_dir) / model_key
+    # Use run_name (which may include context label) for folder naming, but keep model_key for lookup
+    folder_name = run_name or model_key
+    output_path = Path(output_dir) / folder_name
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint_dir = output_path / "checkpoints"
     final_model_dir = output_path / "final_model"
 
     try:
-        # Load model
-        logger.info(f"Loading model {model_key}...")
-        model = BaseDisfluencyModel.from_config(model_key)
+        # Load model (use the config key to resolve registry; pass explicit model_id to be safe)
+        logger.info(f"Loading model {model_key} (id={model_id})...")
+
+        quantization = (quantization or "none").lower().strip()
+        load_in_4bit = quantization == "4bit"
+        load_in_8bit = quantization == "8bit"
+
+        model = BaseDisfluencyModel.from_config(
+            model_key,
+            model_id=model_id,
+            task_type=task_type,
+            device_map="auto",
+            load_in_4bit=load_in_4bit,
+            load_in_8bit=load_in_8bit,
+            torch_dtype=torch.float16,
+        )
         model.load()
-        logger.info(f"Model loaded successfully. Task type: {model.task_type}")
+        logger.info(
+            "Model loaded successfully. Task type: %s, quantization: %s",
+            model.task_type,
+            quantization,
+        )
 
         # Enable LoRA
         logger.info("Enabling LoRA adapters...")
@@ -247,12 +286,32 @@ def train_model(
         train_config["output_dir"] = str(checkpoint_dir)
         train_config["seed"] = seed
 
+        # Quantized runs benefit from bitsandbytes optimizer when available.
+        if (load_in_4bit or load_in_8bit) and "optim" not in train_config:
+            train_config["optim"] = "paged_adamw_8bit"
+
+        # If eval is disabled for OOM mitigation, avoid loading best model at end.
+        if eval_data is None:
+            train_config["eval_strategy"] = "no"
+            train_config["load_best_model_at_end"] = False
+            train_config.pop("metric_for_best_model", None)
+            train_config.pop("greater_is_better", None)
+            train_config.pop("eval_steps", None)
+
         # Set device-specific flags
         if torch.cuda.is_available():
-            train_config["fp16"] = True
-            logger.info("Using FP16 training (CUDA available)")
+            if "fp16" not in train_config and "bf16" not in train_config:
+                train_config["fp16"] = True
+            logger.info("Using CUDA training")
         else:
             logger.warning("CUDA not available; using CPU training (slower)")
+
+        # Enable gradient checkpointing when requested to reduce activation memory.
+        if train_config.get("gradient_checkpointing", False):
+            if hasattr(model.model, "gradient_checkpointing_enable"):
+                model.model.gradient_checkpointing_enable()
+            if hasattr(model.model, "config") and hasattr(model.model.config, "use_cache"):
+                model.model.config.use_cache = False
 
         # Fine-tune
         logger.info(f"Starting training with {len(train_data)} training examples...")
@@ -300,6 +359,13 @@ def train_model(
             "model_id": model_id,
             "error": str(exc),
         }
+    finally:
+        # Always release references between runs to avoid cumulative VRAM growth.
+        try:
+            del model
+        except Exception:
+            pass
+        _cleanup_cuda_memory()
 
 
 # ================================================================================
@@ -310,14 +376,39 @@ def main(
         seed: int = 42,
         skip_models: Optional[List[str]] = None,
         max_models: Optional[int] = None,
+        run_eval: bool = True,
+        training_overrides: Optional[Dict[str, Any]] = None,
+        quantization: str = "4bit",
 ) -> None:
     """
     Main training orchestration.
     """
     skip_models = skip_models or []
+    training_overrides = training_overrides or {}
     logger.info(f"Starting LLM fine-tuning with LoRA")
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Seed: {seed}")
+
+    # Ensure Hugging Face token is available in environment
+    hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+    if not hf_token:
+        logger.error(
+            "A Hugging Face token is required. Please set the environment variable HUGGINGFACE_HUB_TOKEN or HF_HUB_TOKEN."
+        )
+        raise SystemExit(1)
+
+    if hf_login is None:
+        logger.warning(
+            "huggingface_hub is not available; cannot programmatically log in. "
+            "If models require authentication the script may fail. Install huggingface_hub to enable automatic login."
+        )
+    else:
+        try:
+            hf_login(token=hf_token)
+            logger.info("Logged in to Hugging Face hub using environment token")
+        except Exception as exc:
+            logger.exception("Failed to login to Hugging Face hub: %s", exc)
+            raise
 
     # Load dataset (load with context globally so we have the option to use it)
     train_records, eval_records, test_records = load_disfluency_dataset(
@@ -349,7 +440,11 @@ def main(
 
         # Prepare data pairs for the current context state
         train_data = prepare_training_data(train_records, use_context=use_context)
-        eval_data = prepare_training_data(eval_records, use_context=use_context) if eval_records else None
+        eval_data = (
+            prepare_training_data(eval_records, use_context=use_context)
+            if run_eval and eval_records
+            else None
+        )
 
         # Create a specific output directory for this context state
         current_output_dir = str(Path(output_dir) / context_label)
@@ -363,13 +458,16 @@ def main(
             task_type = _infer_task_type(model_key, model_id)
 
             result = train_model(
-                model_key=run_key,  # Use the distinct run key
+                model_key=model_key,  # original config key for lookup
                 model_id=model_id,
                 train_data=train_data,
                 eval_data=eval_data,
                 output_dir=current_output_dir,
                 task_type=task_type,
                 seed=seed,
+                run_name=run_key,
+                quantization=quantization,
+                **training_overrides,
             )
             # Add the context state to the results dictionary for tracking
             result["used_context"] = use_context
@@ -436,12 +534,94 @@ if __name__ == "__main__":
         default=None,
         help="Maximum number of models to train (useful for testing)"
     )
+    parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=1,
+        help="Per-device train batch size (lower this first if CUDA OOM occurs)"
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=1,
+        help="Per-device eval batch size"
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=2e-4,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--no-eval",
+        action="store_true",
+        help="Disable evaluation during training to reduce VRAM usage"
+    )
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing"
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Force fp16 mixed-precision training"
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Force bf16 mixed-precision training (supported GPUs only)"
+    )
+    parser.add_argument(
+        "--quantization",
+        choices=["4bit", "8bit", "none"],
+        default="4bit",
+        help="Model loading quantization mode"
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=384,
+        help="Maximum source/prompt token length used in tokenization"
+    )
+    parser.add_argument(
+        "--max-target-length",
+        type=int,
+        default=128,
+        help="Maximum target token length used in tokenization"
+    )
 
     args = parser.parse_args()
+    training_overrides = {
+        "per_device_train_batch_size": args.train_batch_size,
+        "per_device_eval_batch_size": args.eval_batch_size,
+        "gradient_accumulation_steps": args.grad_accum_steps,
+        "learning_rate": args.learning_rate,
+        "gradient_checkpointing": not args.no_gradient_checkpointing,
+        "max_length": args.max_length,
+        "max_target_length": args.max_target_length,
+    }
+    if args.fp16 and args.bf16:
+        raise SystemExit("Please choose only one of --fp16 or --bf16")
+    if args.fp16:
+        training_overrides["fp16"] = True
+        training_overrides["bf16"] = False
+    elif args.bf16:
+        training_overrides["bf16"] = True
+        training_overrides["fp16"] = False
+
     main(
         output_dir=args.output_dir,
         seed=args.seed,
         skip_models=args.skip_models,
         max_models=args.max_models,
+        run_eval=not args.no_eval,
+        training_overrides=training_overrides,
+        quantization=args.quantization,
     )
-

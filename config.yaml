@@ -2,8 +2,12 @@
 
 # LLM model identifiers
 models:
-  L2.7-B-Chat: "meta-llama/Llama-2-7b-chat-hf"
-  Flan-T5-L: "google/flan-t5-large"
+  L2-7B-Chat: "meta-llama/Llama-2-7b-chat-hf"
+  L3.1-8B-Instruct: "meta-llama/Llama-3.1-8B-Instruct"
+  Q3.5-9B: "Qwen/Qwen3.5-9B"
+  G4-4EB-it: "google/gemma-4-E4B-it"
+  F-T5-L: "google/flan-t5-large"
+  F-T5-XL: "google/flan-t5-xl"
 
 # Text-to-Speech model identifiers
 tts:

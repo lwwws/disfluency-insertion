@@ -129,8 +129,11 @@ class BaseDisfluencyModel(ABC):
     def from_config(cls, model_key: str, **kwargs: Any) -> "BaseDisfluencyModel":
         """Factory: choose the correct concrete subclass based on model metadata."""
         registry = _load_model_registry(Path(kwargs.get("config_path") or ""))
-        model_id = kwargs.get("model_id") or registry.get(model_key) or model_key
-        task = _infer_task_type(model_name=model_key, model_id=model_id, explicit_task=kwargs.get("task_type"))
+        # Extract model_id and task_type from kwargs if provided, so we don't pass them twice
+        explicit_model_id = kwargs.pop("model_id", None)
+        explicit_task_type = kwargs.pop("task_type", None)
+        model_id = explicit_model_id or registry.get(model_key) or model_key
+        task = _infer_task_type(model_name=model_key, model_id=model_id, explicit_task=explicit_task_type)
 
         if task == "seq2seq":
             return Seq2SeqDisfluencyModel(model_name=model_key, model_id=model_id, task_type=task, **kwargs)
@@ -174,10 +177,26 @@ class BaseDisfluencyModel(ABC):
         model_kwargs: Dict[str, Any] = {"trust_remote_code": True}
         if self.device_map:
             model_kwargs["device_map"] = self.device_map  # type: ignore
-        if self.load_in_4bit:
-            model_kwargs["load_in_4bit"] = True
-        if self.load_in_8bit:
-            model_kwargs["load_in_8bit"] = True
+
+        if self.load_in_4bit or self.load_in_8bit:
+            try:
+                from transformers import BitsAndBytesConfig  # type: ignore
+            except Exception as exc:
+                raise ImportError(
+                    "Quantized loading requested but BitsAndBytesConfig is unavailable. "
+                    "Install bitsandbytes and a compatible transformers build."
+                ) from exc
+
+            if self.load_in_4bit:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+            elif self.load_in_8bit:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
         if self.torch_dtype is not None:
             model_kwargs["torch_dtype"] = self.torch_dtype
 
@@ -187,7 +206,8 @@ class BaseDisfluencyModel(ABC):
         if hasattr(self.model, "config") and self.tokenizer.pad_token_id:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
-        if not self.device_map and torch is not None:
+        # For quantized models with device_map, avoid moving the full model with .to(...).
+        if not self.device_map and not (self.load_in_4bit or self.load_in_8bit) and torch is not None:
             try:
                 self.model = self.model.to(self.device)
             except Exception:
@@ -366,8 +386,8 @@ class BaseDisfluencyModel(ABC):
             warmup_steps: int = 100,
             logging_steps: int = 50,
             save_strategy: str = "epoch",
-            max_length: int = 1024,
-            max_target_length: int = 512,
+            max_length: int = 384,
+            max_target_length: int = 128,
             **training_kwargs: Any,
     ) -> Any:
         """Fine-tune the model. Automatically tokenizes raw tuples/dicts."""
