@@ -36,6 +36,9 @@ from utils.models import BaseDisfluencyModel, _load_model_registry
 from utils.swbd_disfluency_loader import SwbdDisfluencyDataset, Config as DataConfig
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 try:
     # prefer the modern name; huggingface_hub is a light dependency and safe to require for auth
     from huggingface_hub import login as hf_login  # type: ignore
@@ -115,6 +118,8 @@ def load_disfluency_dataset(
     min_len: int = 10,
     add_context: bool = True,
     context_k: int = 3,
+    full_data_path: str = "data/cache/swbd_disfluency_full.jsonl",
+    force_rebuild: bool = False,
 ) -> tuple:
     """
     Load the Switchboard disfluency dataset and return train/eval/test splits.
@@ -125,6 +130,8 @@ def load_disfluency_dataset(
         min_len: Minimum number of tokens for a record to be kept
         add_context: If True, add previous context turns to each record
         context_k: Number of context turns to include
+        full_data_path: Path to save/load the full built dataset (JSONL)
+        force_rebuild: If True, ignore any existing cache and rebuild the dataset
 
     Returns:
         (train_records, eval_records, test_records) where each is a list of dicts
@@ -133,7 +140,16 @@ def load_disfluency_dataset(
     logger.info("Loading Switchboard disfluency dataset...")
 
     cfg = DataConfig()
-    dataset = SwbdDisfluencyDataset(cfg).build()
+
+    if not force_rebuild and Path(full_data_path).exists():
+        logger.info(f"Loading full built dataset from {full_data_path}...")
+        dataset = SwbdDisfluencyDataset.from_jsonl(full_data_path, config=cfg)
+    else:
+        logger.info("Building dataset from raw Zayats/NXT sources...")
+        dataset = SwbdDisfluencyDataset(cfg).build()
+        Path(full_data_path).parent.mkdir(parents=True, exist_ok=True)
+        dataset.save_jsonl(full_data_path)
+        logger.info(f"Saved full built dataset to {full_data_path}")
 
     if add_context:
         logger.info(f"Adding context (k={context_k} turns)...")
@@ -147,6 +163,7 @@ def load_disfluency_dataset(
     logger.info(f"Splitting data: train={train_ratio}, eval={eval_ratio}, test={test_ratio}...")
     dataset.add_splits(
         ratios=(train_ratio, eval_ratio, test_ratio),
+        names=("train", "eval", "test"),  # must match the split names filtered below
         seed=seed,
         by="conv",  # split by conversation to avoid speaker leakage
     )
@@ -379,6 +396,8 @@ def main(
         run_eval: bool = True,
         training_overrides: Optional[Dict[str, Any]] = None,
         quantization: str = "4bit",
+        full_data_path: str = "data/cache/swbd_disfluency_full.jsonl",
+        force_rebuild: bool = False,
 ) -> None:
     """
     Main training orchestration.
@@ -418,6 +437,8 @@ def main(
         test_ratio=0.1,
         add_context=True,
         context_k=3,
+        full_data_path=full_data_path,
+        force_rebuild=force_rebuild,
     )
 
     # Load model registry
@@ -585,6 +606,23 @@ if __name__ == "__main__":
         help="Model loading quantization mode"
     )
     parser.add_argument(
+        "--full-data-path",
+        default="data/cache/swbd_disfluency_full.jsonl",
+        help="Path to the full built-dataset JSONL (loaded if present, else built and saved here)"
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore any existing cache and rebuild the dataset from raw sources"
+    )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help="Restrict training to specific GPUs by setting CUDA_VISIBLE_DEVICES, "
+             "e.g. '0' for one GPU or '0,2' for two. Controls both which and how many "
+             "GPUs device_map='auto' can shard across. Omit to use all visible GPUs."
+    )
+    parser.add_argument(
         "--max-length",
         type=int,
         default=384,
@@ -598,6 +636,13 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Must run before any CUDA initialization (i.e. before main() touches torch.cuda
+    # or loads a model) so device_map='auto' only sees the requested GPUs.
+    if args.gpus is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        logger.info(f"Restricting to GPUs via CUDA_VISIBLE_DEVICES={args.gpus}")
+
     training_overrides = {
         "per_device_train_batch_size": args.train_batch_size,
         "per_device_eval_batch_size": args.eval_batch_size,
@@ -624,4 +669,6 @@ if __name__ == "__main__":
         run_eval=not args.no_eval,
         training_overrides=training_overrides,
         quantization=args.quantization,
+        full_data_path=args.full_data_path,
+        force_rebuild=args.force_rebuild,
     )
