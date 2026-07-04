@@ -188,11 +188,14 @@ class BaseDisfluencyModel(ABC):
                 ) from exc
 
             if self.load_in_4bit:
+                # Dequantize/compute in the model's dtype (bf16 when requested) so
+                # 4-bit matmuls don't force fp16 — fp16 overflows on models like Gemma.
+                compute_dtype = self.torch_dtype if self.torch_dtype in (torch.float16, torch.bfloat16) else torch.float16
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_compute_dtype=compute_dtype,
                 )
             elif self.load_in_8bit:
                 model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
@@ -291,6 +294,37 @@ class BaseDisfluencyModel(ABC):
         self.model = get_peft_model(self.model, cfg)
         self._peft_enabled = True
         self._peft_config = lora_config
+
+    def load_adapter(self, adapter_dir: str, reload_tokenizer: bool = True) -> "BaseDisfluencyModel":
+        """Attach previously trained LoRA adapters onto the loaded base model.
+
+        Inference-time counterpart to ``enable_lora``: call after ``load()`` to
+        wrap the base model with the saved PEFT adapter weights in ``adapter_dir``.
+        By default it also reloads the tokenizer saved alongside the adapter, so
+        any special-token changes made during training are reproduced at eval.
+        """
+        self._ensure_loaded()
+        try:
+            from peft import PeftModel
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise ImportError("peft is required to load adapters: pip install peft") from exc
+
+        if reload_tokenizer:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(adapter_dir, trust_remote_code=True)
+            except Exception:
+                pass  # fall back to the base tokenizer already loaded by load()
+
+        self.model = PeftModel.from_pretrained(self.model, adapter_dir)
+        if hasattr(self.model, "config") and getattr(self.tokenizer, "pad_token_id", None) is not None:
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        try:
+            self.model.eval()
+        except Exception:
+            pass
+
+        self._peft_enabled = True
+        return self
 
     def is_peft(self) -> bool:
         return self._peft_enabled

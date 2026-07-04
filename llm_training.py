@@ -76,13 +76,34 @@ LORA_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+def resolve_lora_config(task_type: str, model_id: str) -> Dict[str, Any]:
+    """Return a LoRA config for this model, applying per-family overrides.
+
+    Gemma-4 E4B is multimodal: its text decoder uses plain ``nn.Linear``
+    q_proj/v_proj (which LoRA supports), but its vision and audio towers wrap
+    the same-named projections in a custom ``Gemma4ClippableLinear`` module
+    that PEFT cannot adapt. A bare ``["q_proj", "v_proj"]`` suffix match hits
+    both, so PEFT errors on the tower wrappers. We exclude the towers instead:
+    LoRA then attaches only to the text decoder's query/value projections,
+    identical to the Llama setup, and text-only batches actually drive them
+    (adapting the towers gives them no gradient -> grad-scaler crash).
+    """
+    cfg = dict(LORA_CONFIGS[task_type])  # copy so we never mutate the shared dict
+
+    if task_type == "causal" and "gemma" in model_id.lower():
+        # Keep the plain-Linear text q_proj/v_proj; drop the vision/audio towers.
+        cfg["exclude_modules"] = r".*(vision_tower|audio_tower).*"
+
+    return cfg
+
+
 # ================================================================================
 # Training Configuration
 # ================================================================================
 TRAINING_CONFIG = {
     "num_train_epochs": 3,
     "per_device_train_batch_size": 1,
-    "per_device_eval_batch_size": 1,
+    "per_device_eval_batch_size": 8,  # eval is forward-only; larger batch is safe + much faster
     "gradient_accumulation_steps": 8,  # keeps effective batch size ~8 with lower VRAM
     "learning_rate": 2e-4,
     "warmup_steps": 100,
@@ -178,6 +199,22 @@ def load_disfluency_dataset(
     return train_records, eval_records, test_records
 
 
+def save_splits(splits_dir: str, train_records, eval_records, test_records) -> None:
+    """Persist the exact train/eval/test records (post context+filter+split) as JSONL.
+
+    These are the canonical splits for this seed. Evaluation loads ``test.jsonl``
+    from here so every model is scored on byte-identical rows — no re-splitting.
+    """
+    out = Path(splits_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for name, records in (("train", train_records), ("eval", eval_records), ("test", test_records)):
+        path = out / f"{name}.jsonl"
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        logger.info(f"Saved {len(records)} {name} records to {path}")
+
+
 def prepare_training_data(
     records: List[Dict[str, Any]],
     use_context: bool = True,
@@ -204,19 +241,24 @@ def prepare_training_data(
         if not fluent or not disfluent:
             continue
 
-        if use_context and "context" in r:
-            context = r.get("context", "").strip()
-            if context:
-                input_text = f"{context}\n\nCurrent: {fluent}"
-            else:
-                input_text = fluent
-        else:
-            input_text = fluent
-
-        pairs.append((input_text, disfluent))
+        pairs.append((build_input_text(r, use_context=use_context), disfluent))
 
     logger.info(f"Prepared {len(pairs)} training pairs")
     return pairs
+
+
+def build_input_text(record: Dict[str, Any], use_context: bool = True) -> str:
+    """Build the model input string for a single record (context-aware).
+
+    Single source of truth shared by training-data prep and evaluation, so the
+    text fed to the model at eval time matches training byte-for-byte.
+    """
+    fluent = record.get("fluent", "").strip()
+    if use_context and "context" in record:
+        context = record.get("context", "").strip()
+        if context:
+            return f"{context}\n\nCurrent: {fluent}"
+    return fluent
 
 
 # ================================================================================
@@ -269,6 +311,10 @@ def train_model(
         load_in_4bit = quantization == "4bit"
         load_in_8bit = quantization == "8bit"
 
+        # Match the mixed-precision dtype used for training (bf16 where supported)
+        # so quantized compute and non-quantized weights don't fight fp16 overflow.
+        compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
         model = BaseDisfluencyModel.from_config(
             model_key,
             model_id=model_id,
@@ -276,7 +322,7 @@ def train_model(
             device_map="auto",
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
-            torch_dtype=torch.float16,
+            torch_dtype=compute_dtype,
         )
         model.load()
         logger.info(
@@ -287,7 +333,7 @@ def train_model(
 
         # Enable LoRA
         logger.info("Enabling LoRA adapters...")
-        lora_cfg = LORA_CONFIGS[task_type]
+        lora_cfg = resolve_lora_config(task_type, model_id)
         logger.info(f"LoRA config: r={lora_cfg['r']}, alpha={lora_cfg['lora_alpha']}, dropout={lora_cfg['lora_dropout']}")
         model.enable_lora(lora_cfg)
         logger.info("LoRA enabled successfully")
@@ -318,7 +364,12 @@ def train_model(
         # Set device-specific flags
         if torch.cuda.is_available():
             if "fp16" not in train_config and "bf16" not in train_config:
-                train_config["fp16"] = True
+                # Prefer bf16 when the GPU supports it: fp16's narrow range makes
+                # Gemma overflow to inf/nan grads. bf16 has fp32's exponent range.
+                if torch.cuda.is_bf16_supported():
+                    train_config["bf16"] = True
+                else:
+                    train_config["fp16"] = True
             logger.info("Using CUDA training")
         else:
             logger.warning("CUDA not available; using CPU training (slower)")
@@ -394,6 +445,7 @@ def main(
         skip_models: Optional[List[str]] = None,
         max_models: Optional[int] = None,
         run_eval: bool = True,
+        run_test_eval: bool = True,
         training_overrides: Optional[Dict[str, Any]] = None,
         quantization: str = "4bit",
         full_data_path: str = "data/cache/swbd_disfluency_full.jsonl",
@@ -441,6 +493,15 @@ def main(
         force_rebuild=force_rebuild,
     )
 
+    # Persist the canonical splits for this seed so evaluation scores every model
+    # on the identical test rows (evaluate.py reads splits/test.jsonl).
+    save_splits(str(Path(output_dir) / "splits"), train_records, eval_records, test_records)
+
+    # # TEMP: tiny debug run
+    # train_records = train_records[:30]
+    # eval_records = eval_records[:5]
+    # test_records = test_records[:5]
+
     # Load model registry
     registry = _load_model_registry()
 
@@ -475,6 +536,13 @@ def main(
             # We append the context label to the model key so we can distinguish them in logs/folders
             run_key = f"{model_key}_{context_label}"
 
+            # Skip runs that already finished (final adapter saved), so re-launching
+            # only trains what's missing instead of redoing completed models.
+            final_model_dir = Path(current_output_dir) / run_key / "final_model"
+            if (final_model_dir / "adapter_model.safetensors").exists():
+                logger.info(f"⏭  Skipping {run_key}: already trained ({final_model_dir} exists)")
+                continue
+
             from utils.models import _infer_task_type
             task_type = _infer_task_type(model_key, model_id)
 
@@ -493,6 +561,27 @@ def main(
             # Add the context state to the results dictionary for tracking
             result["used_context"] = use_context
             results.append(result)
+
+            # Generate + save test-set predictions with the just-trained model.
+            # train_model has already freed its in-memory copy, so predict_for_model
+            # reloads base+adapter fresh (avoids holding two models at once).
+            if run_test_eval and "error" not in result and test_records:
+                from evaluate import predict_for_model  # deferred: evaluate imports from this module
+                adapter_dir = Path(current_output_dir) / run_key / "final_model"
+                preds_path = Path(current_output_dir) / run_key / "test_predictions.jsonl"
+                try:
+                    predict_for_model(
+                        model_key=model_key,
+                        model_id=model_id,
+                        adapter_dir=adapter_dir,
+                        test_records=test_records,
+                        use_context=use_context,
+                        out_path=preds_path,
+                        quantization=quantization,
+                    )
+                    result["test_predictions"] = str(preds_path)
+                except Exception as exc:
+                    logger.exception("Test prediction generation failed for %s: %s", run_key, exc)
 
     # Save results summary globally
     results_file = Path(output_dir) / "training_results.json"
@@ -564,8 +653,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval-batch-size",
         type=int,
-        default=1,
-        help="Per-device eval batch size"
+        default=8,
+        help="Per-device eval batch size (eval is forward-only, so a larger batch than "
+             "train is safe and much faster; lower it if eval OOMs)"
     )
     parser.add_argument(
         "--grad-accum-steps",
@@ -588,6 +678,11 @@ if __name__ == "__main__":
         "--no-gradient-checkpointing",
         action="store_true",
         help="Disable gradient checkpointing"
+    )
+    parser.add_argument(
+        "--no-test-eval",
+        action="store_true",
+        help="Skip generating test-set predictions (test_predictions.jsonl) after each model trains"
     )
     parser.add_argument(
         "--fp16",
@@ -667,6 +762,7 @@ if __name__ == "__main__":
         skip_models=args.skip_models,
         max_models=args.max_models,
         run_eval=not args.no_eval,
+        run_test_eval=not args.no_test_eval,
         training_overrides=training_overrides,
         quantization=args.quantization,
         full_data_path=args.full_data_path,
