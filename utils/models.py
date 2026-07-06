@@ -10,7 +10,7 @@ This module provides a lightweight wrapper around Hugging Face models for:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 
@@ -512,7 +512,7 @@ class Seq2SeqDisfluencyModel(BaseDisfluencyModel):
 
     def generate(
         self,
-        input_text: str,
+        input_texts: Sequence[str],
         *,
         instruction: Optional[str] = None,
         examples: Optional[Sequence[Mapping[str, str]]] = None,
@@ -523,10 +523,14 @@ class Seq2SeqDisfluencyModel(BaseDisfluencyModel):
         do_sample: bool = True,
         num_beams: int = 1,
         **generate_kwargs: Any,
-    ) -> str:
+    ) -> List[str]:
+        """Generate one output per prompt in ``input_texts`` as a single batch."""
         self._ensure_loaded()
-        prompt = self.build_prompt(input_text, instruction=instruction, examples=examples, system_prompt=system_prompt)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, padding=False)
+        prompts = [
+            self.build_prompt(t, instruction=instruction, examples=examples, system_prompt=system_prompt)
+            for t in input_texts
+        ]
+        inputs = self.tokenizer(prompts, return_tensors="pt", truncation=True, padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             outputs = self.model.generate(
@@ -538,7 +542,7 @@ class Seq2SeqDisfluencyModel(BaseDisfluencyModel):
                 num_beams=num_beams,
                 **generate_kwargs,
             )
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        return [self.tokenizer.decode(o, skip_special_tokens=True).strip() for o in outputs]
 
 
 class CausalDisfluencyModel(BaseDisfluencyModel):
@@ -558,7 +562,7 @@ class CausalDisfluencyModel(BaseDisfluencyModel):
 
     def generate(
         self,
-        input_text: str,
+        input_texts: Sequence[str],
         *,
         instruction: Optional[str] = None,
         examples: Optional[Sequence[Mapping[str, str]]] = None,
@@ -569,24 +573,41 @@ class CausalDisfluencyModel(BaseDisfluencyModel):
         do_sample: bool = True,
         num_beams: int = 1,
         **generate_kwargs: Any,
-    ) -> str:
-        self._ensure_loaded()
-        prompt = self.build_prompt(input_text, instruction=instruction, examples=examples, system_prompt=system_prompt)
+    ) -> List[str]:
+        """Generate one output per prompt in ``input_texts`` as a single batch.
 
-        # If tokenizer supports chat templates later, callers can pre-format. For
-        # now we simply send the assembled prompt and slice off prompt tokens.
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, padding=False)
-        input_len = inputs["input_ids"].shape[-1]
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                num_beams=num_beams,
-                **generate_kwargs,
-            )
-        return self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        Left-padding is required so every row's real prompt content ends at
+        the same column, letting us slice off the shared ``input_len`` prefix
+        for the whole batch at once. We flip padding_side only for the
+        duration of this call and restore it afterward: training (fine_tune's
+        DataCollatorForSeq2Seq) needs right-padding, since default position_ids
+        don't account for left-padding at train time the way generate() does.
+        """
+        self._ensure_loaded()
+        prompts = [
+            self.build_prompt(t, instruction=instruction, examples=examples, system_prompt=system_prompt)
+            for t in input_texts
+        ]
+
+        prev_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            # If tokenizer supports chat templates later, callers can pre-format. For
+            # now we simply send the assembled prompts and slice off prompt tokens.
+            inputs = self.tokenizer(prompts, return_tensors="pt", truncation=True, padding=True)
+            input_len = inputs["input_ids"].shape[-1]
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    num_beams=num_beams,
+                    **generate_kwargs,
+                )
+        finally:
+            self.tokenizer.padding_side = prev_padding_side
+        return [self.tokenizer.decode(o[input_len:], skip_special_tokens=True).strip() for o in outputs]
 

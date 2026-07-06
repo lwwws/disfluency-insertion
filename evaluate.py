@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from utils.models import BaseDisfluencyModel, _load_model_registry, _infer_task_type
 from llm_training import build_input_text, _cleanup_cuda_memory
@@ -90,12 +91,17 @@ def predict_for_model(
     num_samples: int = 1,
     seed: int = 42,
     limit: Optional[int] = None,
+    batch_size: int = 8,
 ) -> int:
     """Load one adapter, generate on the test set, write a predictions JSONL.
 
     When do_sample=True, draws `num_samples` samples per row (stored in
     'predictions'); 'prediction' keeps the first draw for back-compat.
     Greedy (do_sample=False) always collapses to a single draw.
+
+    Rows are generated `batch_size` at a time. If a batch fails outright
+    (e.g. one pathological row), we retry it row-by-row so a single bad
+    example doesn't null out the whole chunk.
     """
     task_type = _infer_task_type(model_key, model_id)
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -116,55 +122,87 @@ def predict_for_model(
     context_label = CONTEXT_MODES[use_context]
     records = test_records[:limit] if limit else test_records
 
-    written = 0
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        for idx, r in enumerate(records):
-            fluent = r.get("fluent", "").strip()
-            reference = r.get("disfluent", "").strip()
-            if not fluent or not reference:
-                continue
-
-            input_text = build_input_text(r, use_context=use_context)
-
-            samples: List[Optional[str]] = []
-            for s in range(k):
+    def generate_batch(texts: List[str], draw: int) -> List[Optional[str]]:
+        """One batched generate() call, falling back to per-row calls on failure."""
+        try:
+            return model.generate(
+                texts,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else 1.0,
+                top_p=top_p if do_sample else 1.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Batch generation failed (draw %s, %s rows): %s; retrying row-by-row",
+                draw, len(texts), exc,
+            )
+            preds: List[Optional[str]] = []
+            for text in texts:
                 try:
-                    pred = model.generate(
-                        input_text,
+                    preds.append(model.generate(
+                        [text],
                         max_new_tokens=max_new_tokens,
                         do_sample=do_sample,
                         temperature=temperature if do_sample else 1.0,
                         top_p=top_p if do_sample else 1.0,
-                    )
-                except Exception as exc:
-                    logger.warning("Generation failed on row %s (draw %s): %s", idx, s, exc)
-                    pred = None
-                samples.append(pred)
+                    )[0])
+                except Exception as row_exc:
+                    logger.warning("Generation failed on row (draw %s): %s", draw, row_exc)
+                    preds.append(None)
+            return preds
 
-            row = {
-                "id": r.get("id", r.get("uid", idx)),
-                "conv": r.get("conv"),
-                "split": r.get("split"),
-                "model_key": model_key,
-                "model_id": model_id,
-                "context_mode": context_label,
-                "context": r.get("context") if use_context else None,
-                "input_text": input_text,
-                "fluent": fluent,
-                "reference": reference,
-                "prediction": samples[0],      # back-compat: first draw
-                "predictions": samples,        # all k draws
-                "decode": {                    # provenance so you can't mix protocols by accident
-                    "do_sample": do_sample, "temperature": temperature,
-                    "top_p": top_p, "num_samples": k, "seed": seed,
-                },
-            }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            written += 1
+    written = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f, tqdm(
+        total=len(records), desc=f"{model_key} [{context_label}]", unit="row"
+    ) as pbar:
+        for batch_start in range(0, len(records), batch_size):
+            batch = list(enumerate(records[batch_start:batch_start + batch_size], start=batch_start))
 
-            if written % 50 == 0:
-                logger.info(f"  {model_key} [{context_label}]: {written} rows...")
+            valid = []
+            for idx, r in batch:
+                fluent = r.get("fluent", "").strip()
+                reference = r.get("disfluent", "").strip()
+                if not fluent or not reference:
+                    continue
+                input_text = build_input_text(r, use_context=use_context)
+                valid.append((idx, r, fluent, reference, input_text))
+
+            if not valid:
+                pbar.update(len(batch))
+                continue
+
+            input_texts = [v[4] for v in valid]
+            samples_per_row: List[List[Optional[str]]] = [[] for _ in valid]
+            for s in range(k):
+                preds = generate_batch(input_texts, s)
+                for row_samples, pred in zip(samples_per_row, preds):
+                    row_samples.append(pred)
+
+            for (idx, r, fluent, reference, input_text), samples in zip(valid, samples_per_row):
+                row = {
+                    "id": r.get("id", r.get("uid", idx)),
+                    "conv": r.get("conv"),
+                    "split": r.get("split"),
+                    "model_key": model_key,
+                    "model_id": model_id,
+                    "context_mode": context_label,
+                    "context": r.get("context") if use_context else None,
+                    "input_text": input_text,
+                    "fluent": fluent,
+                    "reference": reference,
+                    "prediction": samples[0],      # back-compat: first draw
+                    "predictions": samples,        # all k draws
+                    "decode": {                    # provenance so you can't mix protocols by accident
+                        "do_sample": do_sample, "temperature": temperature,
+                        "top_p": top_p, "num_samples": k, "seed": seed,
+                    },
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                written += 1
+
+            pbar.update(len(batch))
 
     logger.info(f"✓ Wrote {written} predictions to {out_path}")
 
@@ -187,6 +225,7 @@ def main(
     limit: Optional[int] = None,
     skip_models: Optional[List[str]] = None,
     overwrite: bool = False,
+    batch_size: int = 8,
 ) -> None:
     skip_models = skip_models or []
     _hf_login()
@@ -222,6 +261,7 @@ def main(
                     quantization=quantization, max_new_tokens=max_new_tokens,
                     do_sample=do_sample, temperature=temperature, top_p=top_p,
                     num_samples=num_samples, seed=seed, limit=limit,
+                    batch_size=batch_size,
                 )
                 summary.append((run_key, n, str(out_path)))
             except Exception as exc:
@@ -255,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--pred-filename", default="test_predictions.jsonl",
                         help="Output filename; change it to avoid overwriting greedy predictions")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch-size", type=int, default=8, help="Rows generated per batched model.generate() call")
 
     args = parser.parse_args()
 
@@ -264,4 +305,5 @@ if __name__ == "__main__":
         temperature=args.temperature, top_p=args.top_p, num_samples=args.num_samples,
         seed=args.seed, pred_filename=args.pred_filename,
         limit=args.limit, skip_models=args.skip_models, overwrite=args.overwrite,
+        batch_size=args.batch_size,
     )
