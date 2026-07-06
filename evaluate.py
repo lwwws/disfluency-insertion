@@ -85,27 +85,33 @@ def predict_for_model(
     quantization: str = "4bit",
     max_new_tokens: int = 128,
     do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    num_samples: int = 1,
+    seed: int = 42,
     limit: Optional[int] = None,
 ) -> int:
-    """Load one adapter, generate on the test set, and write a predictions JSONL.
+    """Load one adapter, generate on the test set, write a predictions JSONL.
 
-    Returns the number of rows written.
+    When do_sample=True, draws `num_samples` samples per row (stored in
+    'predictions'); 'prediction' keeps the first draw for back-compat.
+    Greedy (do_sample=False) always collapses to a single draw.
     """
     task_type = _infer_task_type(model_key, model_id)
     compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     logger.info(f"Loading base {model_key} ({model_id}) + adapter {adapter_dir}...")
     model = BaseDisfluencyModel.from_config(
-        model_key,
-        model_id=model_id,
-        task_type=task_type,
-        device_map="auto",
-        load_in_4bit=quantization == "4bit",
-        load_in_8bit=quantization == "8bit",
+        model_key, model_id=model_id, task_type=task_type, device_map="auto",
+        load_in_4bit=quantization == "4bit", load_in_8bit=quantization == "8bit",
         torch_dtype=compute_dtype,
     )
     model.load()
     model.load_adapter(str(adapter_dir))
+
+    # Greedy is deterministic -> one draw is enough; sampling needs a seed for reproducibility.
+    k = num_samples if do_sample else 1
+    torch.manual_seed(seed)
 
     context_label = CONTEXT_MODES[use_context]
     records = test_records[:limit] if limit else test_records
@@ -117,18 +123,24 @@ def predict_for_model(
             fluent = r.get("fluent", "").strip()
             reference = r.get("disfluent", "").strip()
             if not fluent or not reference:
-                continue  # same rows training would have skipped
+                continue
 
             input_text = build_input_text(r, use_context=use_context)
-            try:
-                prediction = model.generate(
-                    input_text,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=do_sample,
-                )
-            except Exception as exc:  # keep going; record the failure
-                logger.warning("Generation failed on row %s: %s", idx, exc)
-                prediction = None
+
+            samples: List[Optional[str]] = []
+            for s in range(k):
+                try:
+                    pred = model.generate(
+                        input_text,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=do_sample,
+                        temperature=temperature if do_sample else 1.0,
+                        top_p=top_p if do_sample else 1.0,
+                    )
+                except Exception as exc:
+                    logger.warning("Generation failed on row %s (draw %s): %s", idx, s, exc)
+                    pred = None
+                samples.append(pred)
 
             row = {
                 "id": r.get("id", r.get("uid", idx)),
@@ -138,10 +150,15 @@ def predict_for_model(
                 "model_id": model_id,
                 "context_mode": context_label,
                 "context": r.get("context") if use_context else None,
-                "input_text": input_text,   # exact text fed to the model
-                "fluent": fluent,           # clean input
-                "reference": reference,     # gold disfluent target
-                "prediction": prediction,   # model's disfluent output
+                "input_text": input_text,
+                "fluent": fluent,
+                "reference": reference,
+                "prediction": samples[0],      # back-compat: first draw
+                "predictions": samples,        # all k draws
+                "decode": {                    # provenance so you can't mix protocols by accident
+                    "do_sample": do_sample, "temperature": temperature,
+                    "top_p": top_p, "num_samples": k, "seed": seed,
+                },
             }
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             written += 1
@@ -162,6 +179,11 @@ def main(
     quantization: str = "4bit",
     max_new_tokens: int = 128,
     do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    num_samples: int = 1,
+    seed: int = 42,
+    pred_filename: str = "test_predictions.jsonl",
     limit: Optional[int] = None,
     skip_models: Optional[List[str]] = None,
     overwrite: bool = False,
@@ -189,22 +211,17 @@ def main(
                 logger.info(f"Skipping {run_key}: no adapter at {adapter_dir}")
                 continue
 
-            out_path = ctx_dir / run_key / "test_predictions.jsonl"
+            out_path = ctx_dir / run_key / pred_filename
             if out_path.exists() and not overwrite:
                 logger.info(f"Skipping {run_key}: predictions already exist ({out_path}); pass --overwrite to regenerate")
                 continue
             try:
                 n = predict_for_model(
-                    model_key=model_key,
-                    model_id=model_id,
-                    adapter_dir=adapter_dir,
-                    test_records=test_records,
-                    use_context=use_context,
-                    out_path=out_path,
-                    quantization=quantization,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=do_sample,
-                    limit=limit,
+                    model_key=model_key, model_id=model_id, adapter_dir=adapter_dir,
+                    test_records=test_records, use_context=use_context, out_path=out_path,
+                    quantization=quantization, max_new_tokens=max_new_tokens,
+                    do_sample=do_sample, temperature=temperature, top_p=top_p,
+                    num_samples=num_samples, seed=seed, limit=limit,
                 )
                 summary.append((run_key, n, str(out_path)))
             except Exception as exc:
@@ -231,14 +248,20 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N test rows (for quick checks)")
     parser.add_argument("--skip-models", nargs="+", default=[], help="Model keys to skip")
     parser.add_argument("--overwrite", action="store_true", help="Regenerate predictions even if test_predictions.jsonl already exists")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--num-samples", type=int, default=1,
+                        help="Draws per row when --sample is set (ignored for greedy)")
+    parser.add_argument("--pred-filename", default="test_predictions.jsonl",
+                        help="Output filename; change it to avoid overwriting greedy predictions")
+    parser.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
 
     main(
-        output_dir=args.output_dir,
-        quantization=args.quantization,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=args.sample,
-        limit=args.limit,
-        skip_models=args.skip_models,
-        overwrite=args.overwrite,
+        output_dir=args.output_dir, quantization=args.quantization,
+        max_new_tokens=args.max_new_tokens, do_sample=args.sample,
+        temperature=args.temperature, top_p=args.top_p, num_samples=args.num_samples,
+        seed=args.seed, pred_filename=args.pred_filename,
+        limit=args.limit, skip_models=args.skip_models, overwrite=args.overwrite,
     )
