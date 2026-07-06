@@ -164,6 +164,7 @@ def main(
     do_sample: bool = False,
     limit: Optional[int] = None,
     skip_models: Optional[List[str]] = None,
+    overwrite: bool = False,
 ) -> None:
     skip_models = skip_models or []
     _hf_login()
@@ -189,6 +190,9 @@ def main(
                 continue
 
             out_path = ctx_dir / run_key / "test_predictions.jsonl"
+            if out_path.exists() and not overwrite:
+                logger.info(f"Skipping {run_key}: predictions already exist ({out_path}); pass --overwrite to regenerate")
+                continue
             try:
                 n = predict_for_model(
                     model_key=model_key,
@@ -226,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample", action="store_true", help="Sample instead of greedy decoding (greedy is default for reproducible eval)")
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate the first N test rows (for quick checks)")
     parser.add_argument("--skip-models", nargs="+", default=[], help="Model keys to skip")
+    parser.add_argument("--overwrite", action="store_true", help="Regenerate predictions even if test_predictions.jsonl already exists")
     args = parser.parse_args()
 
     main(
@@ -235,4 +240,5 @@ if __name__ == "__main__":
         do_sample=args.sample,
         limit=args.limit,
         skip_models=args.skip_models,
+        overwrite=args.overwrite,
     )
