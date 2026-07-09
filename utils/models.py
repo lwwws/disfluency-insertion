@@ -96,6 +96,8 @@ class BaseDisfluencyModel(ABC):
                     "You are an expert assistant that rewrites fluent text into natural "
                     "disfluent speech while preserving meaning."
             ),
+            prompt_style: str = "plain",
+            added_tokens: Optional[Sequence[str]] = None,
             auto_load: bool = False,
             load_in_4bit: bool = False,
             load_in_8bit: bool = False,
@@ -106,6 +108,15 @@ class BaseDisfluencyModel(ABC):
         self.model_id = model_id or model_name  # Fallback if not provided
         self.config_path = config_path
         self.system_prompt = system_prompt
+        # "plain": the hand-rolled System/User/Input/Assistant scaffold (works for
+        # every family incl. seq2seq & base models, trivial loss-mask boundary).
+        # "chat": the model's own tokenizer.apply_chat_template (causal instruct
+        # models only; silently falls back to "plain" when no template exists).
+        self.prompt_style = (prompt_style or "plain").lower().strip()
+        # Extra atomic tokens to register on the tokenizer + resize embeddings for
+        # (e.g. ["<sil>"]). Added as NORMAL tokens, not special, so they stay
+        # atomic yet survive skip_special_tokens=True at decode.
+        self.added_tokens = list(added_tokens or [])
         self.auto_load = auto_load
         self.load_in_4bit = load_in_4bit
         self.load_in_8bit = load_in_8bit
@@ -174,6 +185,10 @@ class BaseDisfluencyModel(ABC):
                 getattr(self.tokenizer, "eos_token", None) or getattr(self.tokenizer, "unk_token", None)
             )
 
+        # Register any extra atomic tokens (e.g. "<sil>") BEFORE the model is built,
+        # so we can size its embedding matrix to the extended vocab just below.
+        self._register_added_tokens()
+
         model_kwargs: Dict[str, Any] = {"trust_remote_code": True}
         if self.device_map:
             model_kwargs["device_map"] = self.device_map  # type: ignore
@@ -205,6 +220,9 @@ class BaseDisfluencyModel(ABC):
 
         # Delegate constructing the HF model to the concrete class
         self.model = self._load_model(model_id, model_kwargs)
+
+        # Grow the embedding matrix to cover any tokens we just added.
+        self._resize_embeddings_to_tokenizer()
 
         if hasattr(self.model, "config") and self.tokenizer.pad_token_id:
             self.model.config.pad_token_id = self.tokenizer.pad_token_id
@@ -267,6 +285,141 @@ class BaseDisfluencyModel(ABC):
         parts.append(f"Input: {input_text.strip()}\nAssistant:")
         return "\n\n".join(parts)
 
+    # ------------------------------------------------------------------
+    # Added tokens / embedding resize
+    # ------------------------------------------------------------------
+    def _register_added_tokens(self) -> None:
+        """Add any ``self.added_tokens`` to the tokenizer as normal atomic tokens.
+
+        Registered with ``special_tokens=False`` on purpose: they become
+        single, unsplittable vocab entries (so "<sil>" is one token, not
+        ``<``/``sil``/``>``) yet are NOT stripped by ``skip_special_tokens=True``
+        at decode time — which is exactly what we want for a content-bearing
+        marker like the silent-pause token.
+        """
+        if not self.added_tokens or self.tokenizer is None:
+            return
+        vocab = self.tokenizer.get_vocab()
+        new = [t for t in self.added_tokens if t not in vocab]
+        if new:
+            self.tokenizer.add_tokens(new, special_tokens=False)
+
+    def _resize_embeddings_to_tokenizer(self) -> None:
+        """Resize model embeddings to match the (possibly extended) tokenizer.
+
+        No-op when sizes already agree, so it is safe to call unconditionally
+        (e.g. at adapter load time, where the saved tokenizer may carry tokens
+        the freshly loaded base model doesn't yet have room for)."""
+        if self.model is None or self.tokenizer is None:
+            return
+        try:
+            current = self.model.get_input_embeddings().weight.shape[0]
+        except Exception:
+            return
+        target = len(self.tokenizer)
+        if target != current:
+            self.model.resize_token_embeddings(target)
+
+    # ------------------------------------------------------------------
+    # Chat-template prompt construction (opt-in via prompt_style="chat")
+    # ------------------------------------------------------------------
+    def _chat_available(self) -> bool:
+        """True only for causal models whose tokenizer actually has a chat template."""
+        return (
+            self.prompt_style == "chat"
+            and self.task_type != "seq2seq"
+            and bool(getattr(self.tokenizer, "chat_template", None))
+        )
+
+    def _chat_messages(
+        self,
+        input_text: str,
+        *,
+        instruction: Optional[str] = None,
+        examples: Optional[Sequence[Mapping[str, str]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> list[dict]:
+        """Build the [system, user] message list mirroring build_prompt's content."""
+        instruction = instruction or "Insert natural disfluencies while preserving the meaning of the text."
+        system_prompt = system_prompt or self.system_prompt
+        ex_block = self._format_examples(examples)
+        user = instruction.strip()
+        if ex_block:
+            user += "\n\nExamples:\n" + ex_block
+        user += f"\n\nInput: {input_text.strip()}"
+        messages = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt.strip()})
+        messages.append({"role": "user", "content": user})
+        return messages
+
+    @staticmethod
+    def _merge_system_into_user(messages: list[dict]) -> list[dict]:
+        """Fold a leading system turn into the first user turn.
+
+        Some chat templates (e.g. Gemma) reject a standalone ``system`` role;
+        this is the standard fallback so the same message content still reaches
+        the model."""
+        if not messages or messages[0]["role"] != "system":
+            return messages
+        sys = messages[0]["content"]
+        out, merged = [], False
+        for m in messages[1:]:
+            if not merged and m["role"] == "user":
+                out.append({"role": "user", "content": f"{sys}\n\n{m['content']}"})
+                merged = True
+            else:
+                out.append(dict(m))
+        if not merged:  # no user turn to fold into — promote system to a user turn
+            out.insert(0, {"role": "user", "content": sys})
+        return out
+
+    def _apply_chat(self, messages: list[dict], *, add_generation_prompt: bool) -> str:
+        """Render messages to a prompt STRING via the tokenizer's chat template.
+
+        Returns text (tokenize=False) rather than ids on purpose: the templated
+        string already contains the special tokens literally, so callers tokenize
+        it with add_special_tokens=False for a plain, version-stable id list —
+        avoiding transformers' tokenize=True return-type churn (list vs
+        BatchEncoding across versions). Falls back to folding the system role into
+        the user turn for templates that reject a standalone system message."""
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=add_generation_prompt, tokenize=False,
+            )
+        except Exception:
+            merged = self._merge_system_into_user([dict(m) for m in messages])
+            return self.tokenizer.apply_chat_template(
+                merged, add_generation_prompt=add_generation_prompt, tokenize=False,
+            )
+
+    def _encode_prompt_ids(
+        self,
+        input_text: str,
+        *,
+        instruction: Optional[str] = None,
+        examples: Optional[Sequence[Mapping[str, str]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> list[int]:
+        """Token ids for the PROMPT only (no target).
+
+        Single source of truth shared by generate() and the training-time
+        masked-prefix computation, so the boundary is identical in both. Uses
+        the native chat template when prompt_style="chat" (and one exists),
+        otherwise the plain scaffold — matching the recipe the adapter was
+        trained with."""
+        if self._chat_available():
+            messages = self._chat_messages(
+                input_text, instruction=instruction, examples=examples, system_prompt=system_prompt,
+            )
+            prompt = self._apply_chat(messages, add_generation_prompt=True)
+            # add_special_tokens=False: the template already embedded BOS etc. as text.
+            return self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        prompt = self.build_prompt(
+            input_text, instruction=instruction, examples=examples, system_prompt=system_prompt,
+        )
+        return self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+
     def enable_lora(self, lora_config: dict) -> None:
         """Enable LoRA/PEFT adapters for the currently loaded model.
 
@@ -314,6 +467,11 @@ class BaseDisfluencyModel(ABC):
                 self.tokenizer = AutoTokenizer.from_pretrained(adapter_dir, trust_remote_code=True)
             except Exception:
                 pass  # fall back to the base tokenizer already loaded by load()
+
+        # The saved tokenizer may carry extra tokens (e.g. "<sil>") added at train
+        # time; grow the base embeddings to match before attaching the adapter, so
+        # the adapter's saved lm_head/embed rows line up with the vocab.
+        self._resize_embeddings_to_tokenizer()
 
         self.model = PeftModel.from_pretrained(self.model, adapter_dir)
         if hasattr(self.model, "config") and getattr(self.tokenizer, "pad_token_id", None) is not None:
@@ -378,19 +536,39 @@ class BaseDisfluencyModel(ABC):
             labels_list = []
 
             for inp, tgt in zip(examples["input"], examples["output"]):
-                # Build the exact prompt used during generation (aligns train & test structures)
-                prompt = self.build_prompt(inp)
+                if self._chat_available():
+                    # Chat mode: derive the masked prefix and the full sequence from
+                    # the SAME template so the boundary and the template's own
+                    # end-of-turn token are exactly right (no leading-space / EOS
+                    # guessing). prompt_ids := [system,user]+generation-prompt;
+                    # full_ids := [system,user,assistant].
+                    prompt_ids = self._encode_prompt_ids(inp)
+                    messages = self._chat_messages(inp) + [{"role": "assistant", "content": tgt.strip()}]
+                    full_str = self._apply_chat(messages, add_generation_prompt=False)
+                    full_ids = self.tokenizer(full_str, add_special_tokens=False)["input_ids"]
+                    # Guard against any prefix drift from template quirks: fall back
+                    # to the real common-prefix length rather than trust len(prompt_ids).
+                    n_prompt = len(prompt_ids)
+                    if full_ids[:n_prompt] != prompt_ids:
+                        n_prompt = 0
+                        for a, b in zip(prompt_ids, full_ids):
+                            if a != b:
+                                break
+                            n_prompt += 1
+                    labels = [-100] * n_prompt + full_ids[n_prompt:]
+                else:
+                    # Plain mode: hand-rolled scaffold, prompt & target tokenized
+                    # separately to avoid BPE whitespace-shift bugs.
+                    prompt = self.build_prompt(inp)
+                    prompt_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
 
-                # Tokenize sequentially to completely avoid BPE whitespace shift bugs
-                prompt_ids = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
+                    # Add space before target and append EOS token
+                    target_str = f" {tgt.strip()}{self.tokenizer.eos_token}"
+                    target_ids = self.tokenizer(target_str, add_special_tokens=False)["input_ids"]
 
-                # Add space before target and append EOS token
-                target_str = f" {tgt.strip()}{self.tokenizer.eos_token}"
-                target_ids = self.tokenizer(target_str, add_special_tokens=False)["input_ids"]
-
-                # Concatenate and mask out prompt tokens with -100 so loss is only calculated on the target
-                full_ids = prompt_ids + target_ids
-                labels = [-100] * len(prompt_ids) + target_ids
+                    # Concatenate and mask out prompt tokens with -100 so loss is only calculated on the target
+                    full_ids = prompt_ids + target_ids
+                    labels = [-100] * len(prompt_ids) + target_ids
 
                 # Truncate if necessary
                 max_total = max_length + max_target_length
@@ -584,17 +762,19 @@ class CausalDisfluencyModel(BaseDisfluencyModel):
         don't account for left-padding at train time the way generate() does.
         """
         self._ensure_loaded()
-        prompts = [
-            self.build_prompt(t, instruction=instruction, examples=examples, system_prompt=system_prompt)
+        # Encode each prompt through the shared encoder so chat vs plain matches
+        # exactly what the adapter was trained on. Then left-pad as one batch so
+        # every row's real content ends at the same column and we can slice the
+        # shared prompt width off the whole batch at once.
+        batch_ids = [
+            self._encode_prompt_ids(t, instruction=instruction, examples=examples, system_prompt=system_prompt)
             for t in input_texts
         ]
 
         prev_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         try:
-            # If tokenizer supports chat templates later, callers can pre-format. For
-            # now we simply send the assembled prompts and slice off prompt tokens.
-            inputs = self.tokenizer(prompts, return_tensors="pt", truncation=True, padding=True)
+            inputs = self.tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt")
             input_len = inputs["input_ids"].shape[-1]
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             with torch.no_grad():

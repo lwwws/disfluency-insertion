@@ -26,6 +26,7 @@ Training Configuration:
 """
 
 import argparse
+import gc
 import json
 import logging
 from pathlib import Path
@@ -76,7 +77,17 @@ LORA_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def resolve_lora_config(task_type: str, model_id: str) -> Dict[str, Any]:
+# Wider adapter surface (opt-in via --lora-profile wide): attention out + MLP
+# projections on top of q/v.
+WIDE_CAUSAL_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+def resolve_lora_config(
+    task_type: str,
+    model_id: str,
+    *,
+    lora_profile: str = "paper",
+    modules_to_save: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Return a LoRA config for this model, applying per-family overrides.
 
     Gemma-4 E4B is multimodal: its text decoder uses plain ``nn.Linear``
@@ -87,12 +98,24 @@ def resolve_lora_config(task_type: str, model_id: str) -> Dict[str, Any]:
     LoRA then attaches only to the text decoder's query/value projections,
     identical to the Llama setup, and text-only batches actually drive them
     (adapting the towers gives them no gradient -> grad-scaler crash).
+
+    lora_profile     : "paper" (q/v only, the default/reproduction) or "wide"
+                       (adds k/o + MLP projections; causal models only).
+    modules_to_save  : full (non-LoRA) modules to train and save, e.g.
+                       ["lm_head"] when a new "<sil>" token needs an output row
+                       the frozen base can't provide.
     """
     cfg = dict(LORA_CONFIGS[task_type])  # copy so we never mutate the shared dict
+
+    if task_type == "causal" and lora_profile == "wide":
+        cfg["target_modules"] = list(WIDE_CAUSAL_MODULES)
 
     if task_type == "causal" and "gemma" in model_id.lower():
         # Keep the plain-Linear text q_proj/v_proj; drop the vision/audio towers.
         cfg["exclude_modules"] = r".*(vision_tower|audio_tower).*"
+
+    if modules_to_save:
+        cfg["modules_to_save"] = list(modules_to_save)
 
     return cfg
 
@@ -123,6 +146,7 @@ TRAINING_CONFIG = {
 
 def _cleanup_cuda_memory() -> None:
     """Free GPU allocator cache between model runs to reduce fragmentation/OOMs."""
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -141,6 +165,8 @@ def load_disfluency_dataset(
     context_k: int = 3,
     full_data_path: str = "data/cache/swbd_disfluency_full.jsonl",
     force_rebuild: bool = False,
+    enriched_only: bool = False,
+    min_disfl_tokens: int = 0,
 ) -> tuple:
     """
     Load the Switchboard disfluency dataset and return train/eval/test splits.
@@ -153,6 +179,12 @@ def load_disfluency_dataset(
         context_k: Number of context turns to include
         full_data_path: Path to save/load the full built dataset (JSONL)
         force_rebuild: If True, ignore any existing cache and rebuild the dataset
+        enriched_only: If True, keep only annotation-complete rows (NXT alignment
+            succeeded, so typical <sil>/filled pauses are present). Non-enriched
+            rows are annotation-INCOMPLETE for typical disfluencies, so as targets
+            they may teach omission.
+        min_disfl_tokens: Drop rows with fewer than this many disfluency tokens
+            (0 = keep all; 1 = drop the ~30% pure-copy rows where target == input).
 
     Returns:
         (train_records, eval_records, test_records) where each is a list of dicts
@@ -176,9 +208,21 @@ def load_disfluency_dataset(
         logger.info(f"Adding context (k={context_k} turns)...")
         dataset.add_context(k=context_k, source="fluent", include_other_speaker=True)
 
-    # Filter by minimum length
-    logger.info(f"Filtering records with minimum length {min_len}...")
-    dataset.filter_records(min_tokens_fluent=min_len)
+    # Filter records. Runs AFTER add_context, so non-enriched / low-signal rows
+    # still served as context for their neighbours before being dropped as targets.
+    custom_fn = None
+    if enriched_only or min_disfl_tokens > 0:
+        def custom_fn(r):
+            if enriched_only and not r.get("enriched", False):
+                return False
+            if r.get("n_disfl_tokens", 0) < min_disfl_tokens:
+                return False
+            return True
+    logger.info(
+        "Filtering: min_len=%s, enriched_only=%s, min_disfl_tokens=%s ...",
+        min_len, enriched_only, min_disfl_tokens,
+    )
+    dataset.filter_records(min_tokens_fluent=min_len, custom_fn=custom_fn)
 
     # Add splits
     logger.info(f"Splitting data: train={train_ratio}, eval={eval_ratio}, test={test_ratio}...")
@@ -274,6 +318,10 @@ def train_model(
     seed: int = 42,
     run_name: Optional[str] = None,
     quantization: str = "4bit",
+    prompt_style: str = "plain",
+    add_sil_token: bool = False,
+    sil_train_embeddings: bool = False,
+    lora_profile: str = "paper",
     **training_kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -287,6 +335,11 @@ def train_model(
         output_dir: Directory to save model and checkpoints
         task_type: "causal" or "seq2seq"
         seed: Random seed
+        prompt_style: "plain" (hand-rolled scaffold) or "chat" (native template)
+        add_sil_token: register "<sil>" as an atomic token + resize embeddings
+        sil_train_embeddings: with add_sil_token, also train input embeddings
+            (heavier VRAM); default trains only lm_head so the model can emit it
+        lora_profile: "paper" (q/v only) or "wide" (adds k/o + MLP projections)
         **training_kwargs: Additional training arguments (learning_rate, num_epochs, etc.)
 
     Returns:
@@ -315,6 +368,7 @@ def train_model(
         # so quantized compute and non-quantized weights don't fight fp16 overflow.
         compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+        added_tokens = ["<sil>"] if add_sil_token else None
         model = BaseDisfluencyModel.from_config(
             model_key,
             model_id=model_id,
@@ -323,6 +377,8 @@ def train_model(
             load_in_4bit=load_in_4bit,
             load_in_8bit=load_in_8bit,
             torch_dtype=compute_dtype,
+            prompt_style=prompt_style,
+            added_tokens=added_tokens,
         )
         model.load()
         logger.info(
@@ -331,10 +387,23 @@ def train_model(
             quantization,
         )
 
-        # Enable LoRA
+        # Enable LoRA. A new "<sil>" token needs a trainable output row (and
+        # optionally input embedding) since the frozen base has none — otherwise
+        # the model can't learn to emit it. Default to lm_head-only to keep VRAM
+        # sane on a single 24GB card.
+        modules_to_save = None
+        if add_sil_token:
+            modules_to_save = ["embed_tokens", "lm_head"] if sil_train_embeddings else ["lm_head"]
+
         logger.info("Enabling LoRA adapters...")
-        lora_cfg = resolve_lora_config(task_type, model_id)
-        logger.info(f"LoRA config: r={lora_cfg['r']}, alpha={lora_cfg['lora_alpha']}, dropout={lora_cfg['lora_dropout']}")
+        lora_cfg = resolve_lora_config(
+            task_type, model_id, lora_profile=lora_profile, modules_to_save=modules_to_save,
+        )
+        logger.info(
+            "LoRA config: r=%s, alpha=%s, dropout=%s, profile=%s, target_modules=%s, modules_to_save=%s",
+            lora_cfg["r"], lora_cfg["lora_alpha"], lora_cfg["lora_dropout"], lora_profile,
+            lora_cfg["target_modules"], lora_cfg.get("modules_to_save"),
+        )
         model.enable_lora(lora_cfg)
         logger.info("LoRA enabled successfully")
 
@@ -396,6 +465,23 @@ def train_model(
         logger.info(f"Saving final model to {final_model_dir}...")
         model.save(str(final_model_dir))
 
+        # Record the decoding-relevant recipe next to the adapter so evaluate.py
+        # scores it with the SAME prompt style / vocab it was trained on (can't
+        # silently mix a chat-trained adapter with plain-prompt inference).
+        run_config = {
+            "model_key": model_key,
+            "model_id": model_id,
+            "prompt_style": prompt_style,
+            "added_tokens": added_tokens or [],
+            "lora_profile": lora_profile,
+            "sil_train_embeddings": bool(add_sil_token and sil_train_embeddings),
+        }
+        try:
+            with open(final_model_dir / "run_config.json", "w") as f:
+                json.dump(run_config, f, indent=2)
+        except Exception as exc:
+            logger.warning("Could not write run_config.json: %s", exc)
+
         # Gather metrics
         metrics = {
             "model_key": model_key,
@@ -430,6 +516,10 @@ def train_model(
     finally:
         # Always release references between runs to avoid cumulative VRAM growth.
         try:
+            del trainer
+        except Exception:
+            pass
+        try:
             del model
         except Exception:
             pass
@@ -450,6 +540,12 @@ def main(
         quantization: str = "4bit",
         full_data_path: str = "data/cache/swbd_disfluency_full.jsonl",
         force_rebuild: bool = False,
+        prompt_style: str = "plain",
+        add_sil_token: bool = False,
+        sil_train_embeddings: bool = False,
+        lora_profile: str = "paper",
+        enriched_only: bool = False,
+        min_disfl_tokens: int = 0,
 ) -> None:
     """
     Main training orchestration.
@@ -491,6 +587,8 @@ def main(
         context_k=3,
         full_data_path=full_data_path,
         force_rebuild=force_rebuild,
+        enriched_only=enriched_only,
+        min_disfl_tokens=min_disfl_tokens,
     )
 
     # Persist the canonical splits for this seed so evaluation scores every model
@@ -556,6 +654,10 @@ def main(
                 seed=seed,
                 run_name=run_key,
                 quantization=quantization,
+                prompt_style=prompt_style,
+                add_sil_token=add_sil_token,
+                sil_train_embeddings=sil_train_embeddings,
+                lora_profile=lora_profile,
                 **training_overrides,
             )
             # Add the context state to the results dictionary for tracking
@@ -578,6 +680,8 @@ def main(
                         use_context=use_context,
                         out_path=preds_path,
                         quantization=quantization,
+                        prompt_style=prompt_style,
+                        added_tokens=(["<sil>"] if add_sil_token else None),
                     )
                     result["test_predictions"] = str(preds_path)
                 except Exception as exc:
@@ -729,6 +833,46 @@ if __name__ == "__main__":
         default=128,
         help="Maximum target token length used in tokenization"
     )
+    parser.add_argument(
+        "--prompt-style",
+        choices=["plain", "chat"],
+        default="plain",
+        help="Prompt format: 'plain' (hand-rolled scaffold, default/current behavior) "
+             "or 'chat' (the model's native chat template; causal instruct models only)"
+    )
+    parser.add_argument(
+        "--add-sil-token",
+        action="store_true",
+        help="Register '<sil>' as a single atomic token + resize embeddings, and train "
+             "lm_head so the model can emit it (VRAM: adds a full trainable output head)"
+    )
+    parser.add_argument(
+        "--sil-train-embeddings",
+        action="store_true",
+        help="With --add-sil-token, also train input embeddings (heavier VRAM; default "
+             "trains only lm_head)"
+    )
+    parser.add_argument(
+        "--lora-profile",
+        choices=["paper", "wide"],
+        default="paper",
+        help="'paper' = q/v only (default/reproduction); 'wide' = adds k/o + MLP "
+             "projections for more capacity (causal models only)"
+    )
+    parser.add_argument(
+        "--enriched-only",
+        action="store_true",
+        help="Train only on annotation-complete (NXT-aligned) rows; drops rows "
+             "missing typical <sil>/filled-pause annotation. Non-enriched rows are "
+             "still used as context. Default off = original full dataset."
+    )
+    parser.add_argument(
+        "--min-disfl-tokens",
+        type=int,
+        default=0,
+        help="Drop training rows with fewer than N disfluency tokens (0 = keep all, "
+             "the original behavior; 1 = drop the ~30%% pure-copy rows)"
+    )
 
     args = parser.parse_args()
 
@@ -767,4 +911,10 @@ if __name__ == "__main__":
         quantization=args.quantization,
         full_data_path=args.full_data_path,
         force_rebuild=args.force_rebuild,
+        prompt_style=args.prompt_style,
+        add_sil_token=args.add_sil_token,
+        sil_train_embeddings=args.sil_train_embeddings,
+        lora_profile=args.lora_profile,
+        enriched_only=args.enriched_only,
+        min_disfl_tokens=args.min_disfl_tokens,
     )

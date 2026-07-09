@@ -92,6 +92,8 @@ def predict_for_model(
     seed: int = 42,
     limit: Optional[int] = None,
     batch_size: int = 8,
+    prompt_style: str = "plain",
+    added_tokens: Optional[List[str]] = None,
 ) -> int:
     """Load one adapter, generate on the test set, write a predictions JSONL.
 
@@ -111,8 +113,11 @@ def predict_for_model(
         model_key, model_id=model_id, task_type=task_type, device_map="auto",
         load_in_4bit=quantization == "4bit", load_in_8bit=quantization == "8bit",
         torch_dtype=compute_dtype,
+        prompt_style=prompt_style, added_tokens=added_tokens,
     )
     model.load()
+    # load_adapter reloads the adapter's tokenizer and auto-resizes embeddings, so
+    # any train-time "<sil>" token is reproduced even if added_tokens wasn't passed.
     model.load_adapter(str(adapter_dir))
 
     # Greedy is deterministic -> one draw is enough; sampling needs a seed for reproducibility.
@@ -226,6 +231,7 @@ def main(
     skip_models: Optional[List[str]] = None,
     overwrite: bool = False,
     batch_size: int = 8,
+    prompt_style_override: Optional[str] = None,
 ) -> None:
     skip_models = skip_models or []
     _hf_login()
@@ -254,6 +260,21 @@ def main(
             if out_path.exists() and not overwrite:
                 logger.info(f"Skipping {run_key}: predictions already exist ({out_path}); pass --overwrite to regenerate")
                 continue
+
+            # Reconstruct the training recipe so inference matches it (prompt style,
+            # extra vocab). CLI --prompt-style overrides the recorded value.
+            run_cfg: Dict[str, Any] = {}
+            run_cfg_path = adapter_dir / "run_config.json"
+            if run_cfg_path.exists():
+                try:
+                    with open(run_cfg_path) as rc:
+                        run_cfg = json.load(rc)
+                except Exception as exc:
+                    logger.warning("Could not read %s: %s", run_cfg_path, exc)
+            prompt_style = prompt_style_override or run_cfg.get("prompt_style", "plain")
+            added_tokens = run_cfg.get("added_tokens") or None
+            logger.info("Recipe for %s: prompt_style=%s, added_tokens=%s", run_key, prompt_style, added_tokens)
+
             try:
                 n = predict_for_model(
                     model_key=model_key, model_id=model_id, adapter_dir=adapter_dir,
@@ -262,6 +283,7 @@ def main(
                     do_sample=do_sample, temperature=temperature, top_p=top_p,
                     num_samples=num_samples, seed=seed, limit=limit,
                     batch_size=batch_size,
+                    prompt_style=prompt_style, added_tokens=added_tokens,
                 )
                 summary.append((run_key, n, str(out_path)))
             except Exception as exc:
@@ -296,6 +318,9 @@ if __name__ == "__main__":
                         help="Output filename; change it to avoid overwriting greedy predictions")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=8, help="Rows generated per batched model.generate() call")
+    parser.add_argument("--prompt-style", choices=["plain", "chat"], default=None,
+                        help="Override the prompt style; by default it's read from each run's "
+                             "run_config.json (falls back to 'plain' for older runs)")
 
     args = parser.parse_args()
 
@@ -305,5 +330,5 @@ if __name__ == "__main__":
         temperature=args.temperature, top_p=args.top_p, num_samples=args.num_samples,
         seed=args.seed, pred_filename=args.pred_filename,
         limit=args.limit, skip_models=args.skip_models, overwrite=args.overwrite,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size, prompt_style_override=args.prompt_style,
     )
