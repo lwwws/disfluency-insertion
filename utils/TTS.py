@@ -348,7 +348,7 @@ class ElevenLabsTTS(BaseTTS):
         if self.client is None or _np is None:
             raise ImportError("elevenlabs package and numpy are required")
 
-        model_name = self.model_id or "eleven_monolingual_v1"
+        model_name = self.model_id or "eleven_multilingual_v2"
         voice_id = voice or "JBFqnCBsd6RMkjVDRZzb"
 
         try:
@@ -356,14 +356,17 @@ class ElevenLabsTTS(BaseTTS):
                 text=text,
                 voice_id=voice_id,
                 model_id=model_name,
-                output_format="pcm_24000",
+                output_format=kwargs.pop("output_format", "mp3_44100_128"),
                 **kwargs
             )
             audio_bytes = b"".join(audio_iterator)
 
-            import numpy as _np_local
-            audio = _np_local.frombuffer(audio_bytes, dtype=_np_local.int16).astype(_np_local.float32) / 32767.0
-            return audio, 24000
+            import io
+            if _soundfile is not None:
+                audio, sr = _soundfile.read(io.BytesIO(audio_bytes), dtype="float32")
+                return _np.asarray(audio), int(sr)
+
+            raise ImportError("soundfile is required to decode ElevenLabs MP3 output")
         except Exception as exc:
             raise RuntimeError(f"ElevenLabs TTS failed: {exc}") from exc
 

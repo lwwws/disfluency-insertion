@@ -19,4 +19,4 @@ tts:
   closed_source:
     openai: "gpt-4o-mini-tts"
     cartesia: "sonic-3.5"
-    elevenlabs: "eleven_monolingual_v1"
+    elevenlabs: "eleven_multilingual_v2"

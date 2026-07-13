@@ -42,3 +42,8 @@ Thumbs.db
 
 # Project-local notes
 CLAUDE.md
+# Local generated dataset/cache
+*.jsonl
+
+# Local TTS model assets
+asset/
