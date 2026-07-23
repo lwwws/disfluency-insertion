@@ -339,18 +339,40 @@ class BaseDisfluencyModel(ABC):
         examples: Optional[Sequence[Mapping[str, str]]] = None,
         system_prompt: Optional[str] = None,
     ) -> list[dict]:
-        """Build the [system, user] message list mirroring build_prompt's content."""
+        """Build the chat message list for this input.
+
+        The user-turn content is ``input_text`` verbatim — the CALLER is expected
+        to have already labelled it (e.g. ``Fluent: <sentence>`` /
+        ``Context:\\n...\\n\\nFluent: <sentence>`` via ``prompting.format_input``), so
+        the label lives in one place. The first user turn is prefixed with the
+        instruction.
+
+        Zero-shot (no ``examples``) → ``[system?, user]``.
+        Few-shot → the examples become REAL alternating user/assistant turns
+        (``[system?, user(ex1), assistant(out1), …, user(query)]``) rather than
+        being crammed into one user message, so chat models complete a single
+        assistant turn cleanly instead of continuing a list of examples.
+        """
         instruction = instruction or "Insert natural disfluencies while preserving the meaning of the text."
         system_prompt = system_prompt or self.system_prompt
-        ex_block = self._format_examples(examples)
-        user = instruction.strip()
-        if ex_block:
-            user += "\n\nExamples:\n" + ex_block
-        user += f"\n\nInput: {input_text.strip()}"
-        messages = []
+
+        messages: list[dict] = []
         if system_prompt and system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt.strip()})
-        messages.append({"role": "user", "content": user})
+
+        exs = list(examples or [])
+        if not exs:
+            messages.append({"role": "user", "content": f"{instruction.strip()}\n\n{input_text.strip()}"})
+            return messages
+
+        # First shot's user turn carries the instruction; the rest are bare.
+        for i, ex in enumerate(exs):
+            ex_in = str(ex.get("input", "")).strip()
+            ex_out = str(ex.get("output", "")).strip()
+            prefix = f"{instruction.strip()}\n\n" if i == 0 else ""
+            messages.append({"role": "user", "content": f"{prefix}{ex_in}"})
+            messages.append({"role": "assistant", "content": ex_out})
+        messages.append({"role": "user", "content": input_text.strip()})
         return messages
 
     @staticmethod
