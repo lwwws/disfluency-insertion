@@ -1,0 +1,521 @@
+# Auto-mined few-shot candidates (reproducible via prompt_eng/mine_candidates.py).
+# seed=0  n_per_cell=6  meaningful_context=True
+# Do NOT point the runner at this file - it's a scratch pool.
+examples:
+- id: cand_sw3458_16_8
+  length: short
+  fluent: that's what i don't like about ladies home journal magazines
+  disfluent: that's what i don't like about um ladies home journal magazines
+  context: 'A: is you have too many recipes first of all A: i just don''t you know'
+  types:
+  - filled_pause
+  n_tokens_fluent: 12
+- id: cand_sw4830_14_1
+  length: short
+  fluent: and that's why jury selection is often very difficult
+  disfluent: and that's why jury selection is often very difficult um
+  context: 'A: that''s it B: every person has their opinions'
+  types:
+  - filled_pause
+  n_tokens_fluent: 10
+- id: cand_sw2260_119_1
+  length: short
+  fluent: we're going try to make our decision by july
+  disfluent: we're going uh try to make our decision by july
+  context: 'B: yeah A: but we''re taking our time'
+  types:
+  - filled_pause
+  n_tokens_fluent: 10
+- id: cand_sw3495_48_5
+  length: short
+  fluent: they're not nearly as selective as they used to be
+  disfluent: uh they're not nearly as selective as they used to be
+  context: 'A: they have trouble keeping those full A: so they''ve dropped the'
+  types:
+  - filled_pause
+  n_tokens_fluent: 11
+- id: cand_sw2703_5_1
+  length: short
+  fluent: so i tend to read a lot of baseball books
+  disfluent: so i tend to read a lot of uh baseball books
+  context: 'B: uh-huh A: i''m a big baseball fan'
+  types:
+  - filled_pause
+  n_tokens_fluent: 10
+- id: cand_sw2466_105_1
+  length: short
+  fluent: it's a lot about spiritual warfare and some things like that
+  disfluent: it's a lot about uh spiritual warfare and some things like that
+  context: 'A: no it''s called this present darkness A: it''s kind of unusual book'
+  types:
+  - filled_pause
+  n_tokens_fluent: 12
+- id: cand_sw2772_48_0
+  length: long
+  fluent: y'all weren't getting any of the strings of the tornadoes and stuff were you
+  disfluent: y'all weren't getting any of the strings of uh the tornadoes and stuff were you
+  context: 'B: uh-huh A: we had a pretty rainy fall last year as well'
+  types:
+  - filled_pause
+  n_tokens_fluent: 16
+- id: cand_sw3049_94_3
+  length: long
+  fluent: i was trying to think of the other one that we had rented lately was presumed innocent with harrison ford
+  disfluent: i was trying to think of the other one that we had rented lately <sil> was um presumed innocent <sil> with <sil> uh <sil> harrison ford <sil>
+  context: 'B: yeah i''ve heard that''s B: we rented the other one'
+  types:
+  - filled_pause
+  - silent_pause
+  n_tokens_fluent: 20
+- id: cand_sw2285_100_8
+  length: long
+  fluent: and there's a lot of crime there migrant hispanic farm workers people that are down and out
+  disfluent: and there's a lot of crime there <sil> um <sil> migrant hispanic farm workers <sil> uh people that are down and out <sil>
+  context: 'B: and those that aren''t B: there''s celinas which is about a fifteen minute drive which is mostly migrant workers'
+  types:
+  - filled_pause
+  - silent_pause
+  n_tokens_fluent: 18
+- id: cand_sw3068_57_7
+  length: long
+  fluent: but i think you can also get a bad education at public or private you know
+  disfluent: uh but i think you can also get a bad education at public or private <sil> you know <sil>
+  context: 'A: it''s the minimal cost A: but i think you can get a good education at public or private'
+  types:
+  - filled_pause
+  - silent_pause
+  n_tokens_fluent: 16
+- id: cand_sw4353_9_1
+  length: long
+  fluent: it's kind of hard to talk about this because to me it's very personal
+  disfluent: um <sil> it's kind of hard to talk about this because to me it's very personal
+  context: 'A: um-hum B: and now we''re having two'
+  types:
+  - filled_pause
+  - silent_pause
+  n_tokens_fluent: 16
+- id: cand_sw3113_8_4
+  length: long
+  fluent: and many matters are so complicated that it's so hard to come up with the fair value or the fair sentence
+  disfluent: and <sil> uh <sil> many matters are so complicated that it's so hard to <sil> uh <sil> come up with the fair value <sil> uh <sil> or the fair sentence
+  context: 'A: i''ve been on a few juries A: and as a say i tend to be around civil cases because i''ve been an expert witness some'
+  types:
+  - filled_pause
+  - silent_pause
+  n_tokens_fluent: 22
+- id: cand_sw2836_4_2
+  length: short
+  fluent: i mean crimes against property seem to outnumber crimes against life
+  disfluent: i mean crimes against property seem to outnumber crimes against life <sil>
+  context: 'B: i don''t actually live in the city B: but i''d probably say that''s roughly right'
+  types:
+  - silent_pause
+  n_tokens_fluent: 11
+- id: cand_sw3328_18_1
+  length: short
+  fluent: and of course the poor cann't afford it either
+  disfluent: and of course the poor cann't afford it either <sil>
+  context: 'A: but i''ll see B: i feel like the middle class people are supporting the nation and that the rich are not paying their share'
+  types:
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw3088_121_2
+  length: short
+  fluent: if i had something to hide it's one thing
+  disfluent: if i had something to hide <sil> it's one thing <sil>
+  context: 'B: yeah B: that''s the way i looked at it'
+  types:
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw2734_83_0
+  length: short
+  fluent: i think let's see the oldest is thirty two
+  disfluent: i think <sil> let's see <sil> the oldest is thirty two
+  context: 'B: i doubt very much that they''re using it now B: in fact i''m sure they don''t'
+  types:
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw2362_130_1
+  length: short
+  fluent: and there's no way that that can be done
+  disfluent: and there's no way that <sil> that can be done
+  context: 'A: um-hum B: and in the power plays that it needs to be pulled down and started over again'
+  types:
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw3333_1_2
+  length: short
+  fluent: so i guess that's all i have to do right
+  disfluent: so i guess that's all i have to do <sil> right
+  context: 'A: all right A: i''ve never done it before'
+  types:
+  - silent_pause
+  n_tokens_fluent: 11
+- id: cand_sw2466_66_4
+  length: long
+  fluent: and his whole idea is we can build a better world if people get involved in good community building projects
+  disfluent: and his whole idea is <sil> we can build a better world if people get involved in good community building projects
+  context: 'B: and it was one of the people from there said that B: his latest book and i cann''t recall the name of it is just excellent'
+  types:
+  - silent_pause
+  n_tokens_fluent: 20
+- id: cand_sw2608_243_3
+  length: long
+  fluent: and then we came back and ate out on this it was like a back porch
+  disfluent: and then we came back and ate <sil> out on this <sil> it was like a back porch
+  context: 'A: it was called the back porch A: and they were cooking the stuff you know while we went on this boat ride'
+  types:
+  - silent_pause
+  n_tokens_fluent: 16
+- id: cand_sw3607_6_0
+  length: long
+  fluent: we've been getting quite a bit maybe not quite as bad as some of the folks down around san antonio
+  disfluent: we've been getting quite a bit <sil> maybe not quite as bad as some of the folks down around san antonio <sil>
+  context: 'B: it looks like i''m going to have to get up there again because we may have a leak A: are you in the section of texas that''s been getting so much rain'
+  types:
+  - silent_pause
+  n_tokens_fluent: 21
+- id: cand_sw2743_13_0
+  length: long
+  fluent: however i didn't like it very well when the transmission went out on my car with sixty three thousand miles on it
+  disfluent: however <sil> i didn't like it very well when the transmission went out on my car with sixty three thousand miles on it
+  context: 'B: i don''t think that shoddy not as shoddy B: electrical appliances i think are pretty good reliable'
+  types:
+  - silent_pause
+  n_tokens_fluent: 23
+- id: cand_sw4327_9_3
+  length: long
+  fluent: because the judges sitting in that kind of stuff day after day they know all the procedures
+  disfluent: because the judges sitting in that kind of stuff day after day <sil> they know all the procedures <sil>
+  context: 'A: i mean i would have to look at that A: if they did it with just the judges the police have to do a lot better job of making sure that their evidence is airtight'
+  types:
+  - silent_pause
+  n_tokens_fluent: 17
+- id: cand_sw3074_35_1
+  length: long
+  fluent: it seems to me that she was doing it on her own and living in saint louis
+  disfluent: it seems to me that she was doing it on her own <sil> and living in saint louis <sil>
+  context: 'A: i think she was A: i was trying to remember'
+  types:
+  - silent_pause
+  n_tokens_fluent: 17
+- id: cand_sw3279_4_0
+  length: short
+  fluent: and we really wouldn't feel it in our services
+  disfluent: and <sil> and and we really wouldn't feel it in our services
+  context: 'A: again and that''s get rid of the half the government payroll B: i think that would probably be very possible'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw3688_38_2
+  length: short
+  fluent: and they're not used to it you know on a daily basis
+  disfluent: and they're not <sil> not used to it <sil> you know <sil> on a daily basis
+  context: 'B: and our kids are B: we''ve got some children'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 13
+- id: cand_sw3569_19_3
+  length: short
+  fluent: so that's another source where i keep up with current events
+  disfluent: so that <sil> that's another source that i- <sil> i- i- i <sil> where i keep up with current events
+  context: 'B: so the B: so i and you know work is you know working for state government you hear all about current events about things going on within the state itself'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 12
+- id: cand_sw2062_68_7
+  length: short
+  fluent: and so i've never had the big benefit package
+  disfluent: and so i've never had the <sil> the big benefit package
+  context: 'B: this is the first really large company i''ve worked for i''ve B: always been involved in little small you know privately owned firms'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw3838_54_1
+  length: short
+  fluent: i think afghans and the crocheted little sweaters are wonderful
+  disfluent: i think afghans and <sil> and the crocheted little sweaters <sil> and <sil> are <sil> are wonderful
+  context: 'A: uh-huh B: i think when babies'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw4129_2_1
+  length: short
+  fluent: but on the other hand it is very expensive to maintain
+  disfluent: but <sil> on the other hand <sil> it is very <sil> very expensive to maintain <sil>
+  context: 'A: what are your views on capital punishment B: i have ambivalent feelings because i don''t think it serves as a kind of deterrent we would like to think it is'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 11
+- id: cand_sw4336_24_3
+  length: long
+  fluent: like i say a lot of cases is usually just apartments and break-ins and things like that
+  disfluent: like i say <sil> a lot of <sil> a lot of cases is usually just apartments and <sil> and break-ins and things like that
+  context: 'B: i don''t know B: crime situations here they'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 17
+- id: cand_sw2602_10_3
+  length: long
+  fluent: the team i was with we jumped in on the western tip of the island down on point salinas
+  disfluent: the team i was with <sil> we jumped in on the western tip of <sil> of the island down on point salinas
+  context: 'B: sure there were cuban soldiers there B: but there was also a bunch of russian advisors that were damn good shots'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 19
+- id: cand_sw2502_15_1
+  length: long
+  fluent: there's so many people there that get the kind of control that's bad you know
+  disfluent: there's so many people there that <sil> that that get the kind of control that's bad <sil> you know <sil>
+  context: 'B: uh-huh A: and he was all for it because it''s just like you say'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 17
+- id: cand_sw2018_91_0
+  length: long
+  fluent: i do too especially as women get up in management and can be in on those decision making
+  disfluent: i do too <sil> especially as women get up in management and <sil> and can be in on those decision making <sil>
+  context: 'B: yeah A: and i look for more of that in the next generation'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 18
+- id: cand_sw2062_82_9
+  length: long
+  fluent: so you can have an extra five days off and be paid for them at the time you know
+  disfluent: so you <sil> you can have an extra five days off and be paid for them at the time <sil> you know <sil>
+  context: 'B: and they''ll take a set amount out of each paycheck you know B: and they''re deducting it all along'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 19
+- id: cand_sw2819_68_2
+  length: long
+  fluent: but on the other hand there's a lot of injustice that needs to be changed
+  disfluent: but on the other hand <sil> there's a lot of injustice that needs to be <sil> be changed
+  context: 'B: it''s hard for me to say B: i hope it happens because i''d be one of those that gets caught'
+  types:
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 16
+- id: cand_sw2466_76_1
+  length: short
+  fluent: but he wrote the illusions and a bridge to forever
+  disfluent: but he wro- <sil> he wrote the ill- <sil> the illu- illusions and a bridge over ti- <sil> uh a bridge to forever
+  context: 'A: is it B: it''ll come to me'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 10
+- id: cand_sw3707_22_0
+  length: short
+  fluent: just put them outside i guess unless you catch them in the act
+  disfluent: just <sil> just <sil> y- put them outside <sil> i guess unless you ca- <sil> catch them in the act
+  context: 'B: they say that''s not the way to do it now A: stand outside with them until they'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 13
+- id: cand_sw2466_66_2
+  length: short
+  fluent: and it was one of the people from there said that
+  disfluent: and <sil> uh <sil> it was one of the people from there that uh tha- said that
+  context: 'B: and someone just recently said something really neat about that B: i got involved in beginning experience weekends'
+  types:
+  - filled_pause
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 11
+- id: cand_sw4831_1_6
+  length: short
+  fluent: what sort of benefits would you like to get from a big
+  disfluent: what sort of benefits would you like to get from a big compa-
+  context: 'A: and maybe that''s probably the toughest thing in the whole world to do A: what''s your feeling about benefits'
+  types:
+  - fragment
+  n_tokens_fluent: 12
+- id: cand_sw3150_76_0
+  length: short
+  fluent: and what is he going to do in prison to the other
+  disfluent: and what is he going to do in prison to the other peo-
+  context: 'A: hang B: because i mean that''s just awful'
+  types:
+  - fragment
+  n_tokens_fluent: 12
+- id: cand_sw3830_98_1
+  length: short
+  fluent: and i don't know if you're aware of this
+  disfluent: and i don't know <sil> if you're aware of this ri- <sil>
+  context: 'A: uh-huh B: they were paid that whole time'
+  types:
+  - fragment
+  - silent_pause
+  n_tokens_fluent: 11
+- id: cand_sw2589_40_0
+  length: long
+  fluent: as a part of the revamping of the entire education system on that the public school system i want to see changed too
+  disfluent: th- <sil> the um as a part of the revamping of the entire education system on that lev- <sil> the public school system i want to see changed too
+  context: 'A: i mean either way you know i definitely had to disagree with that A: i think that''s not the way to you know discipline a child by putting him in a closet'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 23
+- id: cand_sw3074_111_2
+  length: long
+  fluent: you cann't be waited on all your life and expect things to always work out
+  disfluent: you <sil> you <sil> you cann't be waited on all your life and expect things to always ha- <sil> ah work ou- <sil> out
+  context: 'A: and i think golly moses you just do your part A: you know people are not'
+  types:
+  - filled_pause
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 16
+- id: cand_sw3988_118_0
+  length: long
+  fluent: and i vowed then that i was not going to listen to that radio station any more if that dj could make such an
+  disfluent: and <sil> i vowed then that i was not going to listen to that radio station any more <sil> if that dj could make such an unedu- <sil>
+  context: 'B: but i was listening to a particular radio station B: and the one dj said who the heck is bonnie rait and why does she deserve five grammies'
+  types:
+  - fragment
+  - silent_pause
+  n_tokens_fluent: 24
+- id: cand_sw3382_55_0
+  length: long
+  fluent: and i'd love to be the first one to step on a planet or like you know
+  disfluent: and i <sil> i'd love to be the first one to step on a planet or some- like <sil> tha- you know <sil>
+  context: 'A: yeah A: i think it''s in people''s nature to be the first to do something'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 18
+- id: cand_sw2022_3_2
+  length: long
+  fluent: so that based on in check coming in and how much i'm spending each half of the month and then trying to also
+  disfluent: so that based on whatever we've got coming in <sil> check coming in <sil> and how much i'm spending each half of the month and then trying to also sp- <sil>
+  context: 'A: and i made a lotus spreadsheet and went through the year using all of our checkbook to figure out what we spent each time and whether we were over or under for each month A: and then basically since then what i''ve done is keep track of it through the checkbook'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 24
+- id: cand_sw3156_44_1
+  length: long
+  fluent: since we've had the crusher all summer i guess we just now maybe have a bag full that we haven't oh
+  disfluent: since we've had the crusher all summer <sil> we <sil> i guess we just now maybe have a bag full that we haven't ta- <sil> oh <sil>
+  context: 'A: where do you take your cans B: as you say it takes a while to build it up'
+  types:
+  - fragment
+  - reparandum
+  - silent_pause
+  n_tokens_fluent: 23
+- id: cand_sw2442_62_0
+  length: short
+  fluent: i think it made parts of it a lot easier
+  disfluent: well i think it made parts of it a lot easier
+  context: 'A: yeah A: maybe it speeded up the process and all that'
+  types:
+  - insertion
+  n_tokens_fluent: 10
+- id: cand_sw2743_32_1
+  length: short
+  fluent: the last thing i bought was a dress last summer
+  disfluent: well the last thing i bought was a dress last summer
+  context: 'A: and have you been buying any clothes lately any new clothes B: i haven''t bought any new'
+  types:
+  - insertion
+  n_tokens_fluent: 10
+- id: cand_sw2397_52_3
+  length: short
+  fluent: but she has three kids all under the age of six
+  disfluent: but she has three kids all under the age of like six
+  context: 'B: and there they B: i suspect they''re fairly simple because the one lady i''ve seen i know that does it i''ve never asked her any questions'
+  types:
+  - insertion
+  n_tokens_fluent: 11
+- id: cand_sw4362_5_2
+  length: short
+  fluent: because i wasn't really listening to the world go by back then
+  disfluent: because i wasn't really like listening to the world go by back then
+  context: 'A: and i''ve seen things change A: i don''t know if i''ve seen things change enough that i can actually'
+  types:
+  - insertion
+  n_tokens_fluent: 13
+- id: cand_sw2669_19_1
+  length: short
+  fluent: and it was only you know twenty nine and thirty cents a liter
+  disfluent: and it was only like you know twenty nine and thirty cents a liter
+  context: 'B: figures A: they started marketing it in liters'
+  types:
+  - insertion
+  n_tokens_fluent: 13
+- id: cand_sw2157_87_8
+  length: short
+  fluent: and then from the twenty to the ten yard line
+  disfluent: and then like from the twenty to the ten yard line
+  context: 'A: just on the lower levels is the highest price A: and then the next highest price is that same area but above it on the upper level'
+  types:
+  - insertion
+  n_tokens_fluent: 10
+- id: cand_sw2177_30_3
+  length: long
+  fluent: i guess he was taking kevin costner to the site where he was going to be or whatever
+  disfluent: i guess he was taking kevin costner to like the site where he was going to be or whatever
+  context: 'B: and ugh B: it when he was first'
+  types:
+  - insertion
+  n_tokens_fluent: 18
+- id: cand_sw2896_45_0
+  length: long
+  fluent: i was going to ask if you planned to paint over it or try to strip it
+  disfluent: well i was going to ask if you planned to paint over it or try to strip it
+  context: 'A: uh-huh B: i''m wondering if my bigger problem is getting the wallpaper taken down first because i think'
+  types:
+  - insertion
+  n_tokens_fluent: 17
+- id: cand_sw4649_2_0
+  length: long
+  fluent: i can profit by this because i'm due with my first in about three months
+  disfluent: well i can profit by this because i'm due with my first in about three months
+  context: 'A: so it''s all over A: but i guess i would say it''s not easy to find what most parents would want'
+  types:
+  - insertion
+  n_tokens_fluent: 16
+- id: cand_sw3086_37_1
+  length: long
+  fluent: we don't use it for things like our accounts and addresses and things like that
+  disfluent: so we don't use it for things like our accounts and addresses and things like that
+  context: 'B: um-hum A: we haven''t really bought any commercially available software at all'
+  types:
+  - insertion
+  n_tokens_fluent: 16
+- id: cand_sw4382_2_1
+  length: long
+  fluent: and it's crystal clear all the time except for during the winter when the inversion sets in
+  disfluent: and it's like crystal clear all the time except for during the winter when the inversion sets in
+  context: 'A: here in logan utah we got a nice little valley here'
+  types:
+  - insertion
+  n_tokens_fluent: 18
+- id: cand_sw3354_81_5
+  length: long
+  fluent: and every year we learn one more thing we didn't know before about these mums
+  disfluent: and every year we learn one more thing we didn't know before like about these mums
+  context: 'A: and i said you know you need to either read neil sperry''s book before you shop or get a reputable nursery because a lot of places are just trying to sell whatever was pretty out there A: and we didn''t know the difference'
+  types:
+  - insertion
+  n_tokens_fluent: 16

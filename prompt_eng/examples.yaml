@@ -1,0 +1,60 @@
+# The few-shot example suite for the prompt-engineering baseline.
+# ===========================================================================
+# SEMANTICS (flags - what the runner uses)
+#   * FEW-SHOT  = every entry here, EXCEPT any tagged `few_shot: false`.
+#   * ONE-SHOT  = the single entry tagged `one_shot: true`.
+#   * ZERO-SHOT = no examples (file ignored).
+#   `--few-k N` optionally caps few-shot to the first N entries.
+#
+# HOW THIS SUITE WAS BUILT
+#   1. python prompt_eng/mine_candidates.py   -> prompt_eng/candidates.yaml
+#      (real gold TRAIN rows, type x length grid, meaningful context, ranked so
+#       the CLEANEST instance of each phenomenon is first).
+#   2. Hand-pick the clearest ones covering the types, at short and long lengths.
+# ===========================================================================
+
+examples:
+  # ---- SHORT ---------------------------------------------------------------
+  - id: cand_sw2658_32_2
+    length: short
+    fluent: and the guy said that the computer would fit our needs
+    disfluent: and the guy said <sil> uh <sil> that the computer would fit our needs
+    context: 'B: and so we went there B: we told them about the stuff'
+    types: [filled_pause, silent_pause]
+
+  - id: cand_sw2062_68_7
+    length: short
+    fluent: and so i've never had the big benefit package
+    disfluent: and so i've never had the <sil> the big benefit package
+    context: "B: this is the first really large company i've worked for i've B: always been involved in little small you know privately owned firms"
+    types: [reparandum, silent_pause]
+
+  - id: cand_sw2669_19_1
+    length: short
+    fluent: and it was only you know twenty nine and thirty cents a liter
+    disfluent: and it was only like you know twenty nine and thirty cents a liter
+    context: 'B: figures A: they started marketing it in liters'
+    types: [insertion]
+
+  - id: cand_sw2466_76_1
+    length: short
+    fluent: but he wrote the illusions and a bridge to forever
+    disfluent: but he wro- <sil> he wrote the ill- <sil> the illu- illusions and a bridge over ti- <sil> uh a bridge to forever
+    context: "A: is it B: it'll come to me"
+    types: [fragment, reparandum, silent_pause]
+
+  # ---- LONG ----------------------------------------------------------------
+  - id: cand_sw2285_100_8
+    length: long
+    fluent: and there's a lot of crime there migrant hispanic farm workers people that are down and out
+    disfluent: and there's a lot of crime there <sil> um <sil> migrant hispanic farm workers <sil> uh people that are down and out <sil>
+    context: "B: and those that aren't B: there's celinas which is about a fifteen minute drive which is mostly migrant workers"
+    types: [filled_pause, silent_pause]
+
+  - id: cand_sw2005_19_3
+    length: long
+    fluent: and she had used a walker for quite sometime probably about six to nine months
+    disfluent: and <sil> um <sil> she had used a walker for <sil> for quite sometime <sil> probably about six to nine months
+    context: 'A: yeah A: probably the hardest thing in my family my grandmother she had to be put in nursing home'
+    types: [filled_pause, reparandum, silent_pause]
+    one_shot: true
