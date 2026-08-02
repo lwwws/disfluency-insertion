@@ -5,10 +5,10 @@ and for each sample synthesize:
  - the reference disfluent text (as the "original" when raw audio is not available)
  - each requested model's prediction (reads predictions JSONL under outputs/* and matches model_key)
 
-Outputs are written to outputs/tts_for_turing_test/<sample_idx>/ with a small manifest.csv.
+Outputs are written to outputs/tts_for_turing_test/<backend_name>/<sample_idx>/ with a manifest.csv per backend.
 
 Usage example:
-  python tts_for_turing_test.py --models L3.1-8B-Instruct Llama-2-13B --num-samples 10
+  python tts_for_turing_test.py --models L3.1-8B-Instruct Llama-2-13B --num-samples 10 --tts-backends chattts glow-tts
 
 If you DO have original disfluent audio files available locally, provide their root using
 --original-audio-root and ensure test records include metadata to map into that dir.
@@ -41,7 +41,7 @@ def sanitize_for_tts(text: str) -> str:
     # normalize whitespace
     txt = " ".join(txt.split())
     # remove straight and curly apostrophes
-    txt = txt.replace("'", "").replace("’", "")
+    txt = txt.replace("'", "").replace("'", "")
     # remove hyphens that occur at token edges (e.g., st- or -member)
     txt = re.sub(r"(\w)-(?=\s|$)", r"\1", txt)
     txt = re.sub(r"(?<=\s)-(?=\w)", "", txt)
@@ -215,7 +215,7 @@ def main():
                     help="Root dirs to search for test_predictions.jsonl (and their sampled variants)")
     ap.add_argument("--context-mode", choices=["with_context", "no_context", "any"], default="with_context",
                     help="Default context mode for legacy --models list (ignored when --model-specs is used).")
-    ap.add_argument("--tts-backend", default="chattts", help="TTS backend key from config.yaml")
+    ap.add_argument("--tts-backends", nargs="+", default=["chattts"], help="TTS backend keys from config.yaml (e.g., chattts glow-tts tacotron2)")
     ap.add_argument("--speaker-mode", choices=("same_all", "same_pair", "backend_default"), default="same_all")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--original-audio-root", default=None,
@@ -281,182 +281,192 @@ def main():
 
     # TTS setup (lazy import to avoid pulling heavy ML deps when not needed)
     from utils.TTS import get_tts, prepare_text_for_tts
-    tts = get_tts(args.tts_backend, device="cpu")
 
-    # Speaker selection and persistence
-    saved_global_speaker = out_dir / "_saved_speaker.json"
-    shared_speaker = None
-    if args.speaker_mode == "same_all":
-        # Reuse a global speaker across runs; persist to outputs dir
-        if saved_global_speaker.exists():
-            try:
-                js = json.loads(saved_global_speaker.read_text(encoding="utf-8"))
-                shared_speaker = js.get("speaker")
-            except Exception:
-                shared_speaker = None
-        if shared_speaker is None:
-            shared_speaker = tts.sample_speaker()
-            try:
-                saved_global_speaker.write_text(json.dumps({"speaker": shared_speaker}), encoding="utf-8")
-            except Exception:
-                pass
+    # Loop over each TTS backend and generate audio
+    for tts_backend in args.tts_backends:
+        print(f"\n--- Processing TTS backend: {tts_backend} ---")
+        
+        backend_out_dir = out_dir / tts_backend
+        backend_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        tts = get_tts(tts_backend, device="cpu")
 
-    manifest = []
-    # Load existing manifest if present so re-running adds new models only
-    existing_manifest_path = out_dir / "manifest.csv"
-    existing_manifest = None
-    if existing_manifest_path.exists():
-        try:
-            existing_manifest = pd.read_csv(existing_manifest_path)
-        except Exception:
-            existing_manifest = None
-    for i, rec in enumerate(picked, start=1):
-        sample_dir = out_dir / f"sample_{i:02d}"
-        sample_dir.mkdir(parents=True, exist_ok=True)
-
-        # Reference: either original audio (if provided and found) or synthesized reference text
-        ref_wav = None
-        if args.original_audio_root:
-            orig_root = Path(args.original_audio_root)
-            candidates = []
-            conv = rec.get("conv")
-            speaker = rec.get("speaker")
-            if conv and speaker:
-                candidates.extend([
-                    orig_root / f"{conv}_{speaker}.wav",
-                    orig_root / f"{conv}.{speaker}.wav",
-                ])
-            if conv:
-                for p in orig_root.rglob(f"*{conv}*.wav"):
-                    candidates.append(p)
-            existing = [c for c in candidates if c.exists()]
-            if existing:
-                ref_wav = existing[0]
-
-        # sample-level speaker persistence (for same_pair)
-        pair_speaker = None
-        sample_speaker_path = sample_dir / "_speaker.json"
-        if args.speaker_mode == "same_pair":
-            if sample_speaker_path.exists():
+        # Speaker selection and persistence (per backend)
+        saved_global_speaker = backend_out_dir / "_saved_speaker.json"
+        shared_speaker = None
+        if args.speaker_mode == "same_all":
+            # Reuse a global speaker across runs; persist to backend-specific dir
+            if saved_global_speaker.exists():
                 try:
-                    js = json.loads(sample_speaker_path.read_text(encoding="utf-8"))
-                    pair_speaker = js.get("speaker")
+                    js = json.loads(saved_global_speaker.read_text(encoding="utf-8"))
+                    shared_speaker = js.get("speaker")
                 except Exception:
-                    pair_speaker = None
-            if pair_speaker is None:
-                pair_speaker = tts.sample_speaker()
+                    shared_speaker = None
+            if shared_speaker is None:
+                shared_speaker = tts.sample_speaker()
                 try:
-                    sample_speaker_path.write_text(json.dumps({"speaker": pair_speaker}), encoding="utf-8")
+                    saved_global_speaker.write_text(json.dumps({"speaker": shared_speaker}), encoding="utf-8")
                 except Exception:
                     pass
 
-        if ref_wav is None:
-            # Synthesize the reference disfluent text
-            text = prepare_text_for_tts(rec.get("disfluent", ""), args.tts_backend)
-            text = sanitize_for_tts(text)
-            ref_wav = sample_dir / "reference_disfluent.wav"
-            if args.speaker_mode == "same_pair":
-                synth_kwargs = {"speaker": pair_speaker} if pair_speaker is not None else {}
-            else:
-                synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
+        manifest = []
+        # Load existing manifest if present so re-running adds new models only
+        existing_manifest_path = backend_out_dir / "manifest.csv"
+        existing_manifest = None
+        if existing_manifest_path.exists():
             try:
-                if not ref_wav.exists():
-                    tts.synthesize_to_file(text, str(ref_wav), **synth_kwargs)
-            except Exception as exc:
-                # fallback: try again with more aggressive sanitization
-                text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", text)
-                tts.synthesize_to_file(text2, str(ref_wav), **synth_kwargs)
+                existing_manifest = pd.read_csv(existing_manifest_path)
+            except Exception:
+                existing_manifest = None
+        
+        for i, rec in enumerate(picked, start=1):
+            sample_dir = backend_out_dir / f"sample_{i:02d}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
 
-        # For each requested spec, synthesize its prediction (if available)
-        for label, entry in preds_map.items():
-            spec = entry["spec"]
-            row = None
-            # try source_index first
-            sidx = rec.get("source_index")
-            if sidx is not None and int(sidx) in entry["by_index"]:
-                row = entry["by_index"].get(int(sidx))
-            else:
-                # try by id
-                rid = rec.get("id")
-                if rid is not None and str(rid) in entry["by_id"]:
-                    row = entry["by_id"].get(str(rid))
+            # Reference: either original audio (if provided and found) or synthesized reference text
+            ref_wav = None
+            if args.original_audio_root:
+                orig_root = Path(args.original_audio_root)
+                candidates = []
+                conv = rec.get("conv")
+                speaker = rec.get("speaker")
+                if conv and speaker:
+                    candidates.extend([
+                        orig_root / f"{conv}_{speaker}.wav",
+                        orig_root / f"{conv}.{speaker}.wav",
+                    ])
+                if conv:
+                    for p in orig_root.rglob(f"*{conv}*.wav"):
+                        candidates.append(p)
+                existing = [c for c in candidates if c.exists()]
+                if existing:
+                    ref_wav = existing[0]
 
-            if row is None:
-                # skip if not found
-                print(f"Warning: no prediction found for {label} on sample {i}; skipping")
-                continue
-
-            pred_text = row.get("prediction") or (row.get("predictions") and row.get("predictions")[0]) or ""
-            tts_text = prepare_text_for_tts(pred_text, args.tts_backend)
-            tts_text = sanitize_for_tts(tts_text)
-            safe_label = label.replace("/", "_").replace(" ", "_")
-            model_wav = sample_dir / f"model_{safe_label}.wav"
-
-            # skip existing model wavs if present in existing manifest (so reruns add only new models)
-            already_done = False
-            if existing_manifest is not None:
-                try:
-                    # match by sample number and label
-                    row_sel = existing_manifest[(existing_manifest['sample'] == i) & (existing_manifest['label'] == label)]
-                    if not row_sel.empty and Path(row_sel.iloc[0]['model_wav']).exists():
-                        already_done = True
-                except Exception:
-                    already_done = False
-            if already_done and not args.force:
-                print(f"Skipping existing model {label} for sample {i}")
-                continue
-            if already_done and args.force:
-                # remove existing file so we overwrite
-                try:
-                    Path(existing_manifest.loc[(existing_manifest['sample'] == i) & (existing_manifest['label'] == label), 'model_wav'].values[0]).unlink()
-                except Exception:
-                    pass
-
+            # sample-level speaker persistence (for same_pair)
+            pair_speaker = None
+            sample_speaker_path = sample_dir / "_speaker.json"
             if args.speaker_mode == "same_pair":
-                synth_kwargs = {"speaker": pair_speaker} if pair_speaker is not None else {}
-            else:
-                synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
+                if sample_speaker_path.exists():
+                    try:
+                        js = json.loads(sample_speaker_path.read_text(encoding="utf-8"))
+                        pair_speaker = js.get("speaker")
+                    except Exception:
+                        pair_speaker = None
+                if pair_speaker is None:
+                    pair_speaker = tts.sample_speaker()
+                    try:
+                        sample_speaker_path.write_text(json.dumps({"speaker": pair_speaker}), encoding="utf-8")
+                    except Exception:
+                        pass
 
+            if ref_wav is None:
+                # Synthesize the reference disfluent text
+                text = prepare_text_for_tts(rec.get("disfluent", ""), tts_backend)
+                text = sanitize_for_tts(text)
+                ref_wav = sample_dir / "reference_disfluent.wav"
+                if args.speaker_mode == "same_pair":
+                    synth_kwargs = {"speaker": pair_speaker} if pair_speaker is not None else {}
+                else:
+                    synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
+                try:
+                    if not ref_wav.exists():
+                        tts.synthesize_to_file(text, str(ref_wav), **synth_kwargs)
+                except Exception as exc:
+                    # fallback: try again with more aggressive sanitization
+                    text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", text)
+                    tts.synthesize_to_file(text2, str(ref_wav), **synth_kwargs)
+
+            # For each requested spec, synthesize its prediction (if available)
+            for label, entry in preds_map.items():
+                spec = entry["spec"]
+                row = None
+                # try source_index first
+                sidx = rec.get("source_index")
+                if sidx is not None and int(sidx) in entry["by_index"]:
+                    row = entry["by_index"].get(int(sidx))
+                else:
+                    # try by id
+                    rid = rec.get("id")
+                    if rid is not None and str(rid) in entry["by_id"]:
+                        row = entry["by_id"].get(str(rid))
+
+                if row is None:
+                    # skip if not found
+                    print(f"Warning: no prediction found for {label} on sample {i}; skipping")
+                    continue
+
+                pred_text = row.get("prediction") or (row.get("predictions") and row.get("predictions")[0]) or ""
+                tts_text = prepare_text_for_tts(pred_text, tts_backend)
+                tts_text = sanitize_for_tts(tts_text)
+                safe_label = label.replace("/", "_").replace(" ", "_")
+                model_wav = sample_dir / f"model_{safe_label}.wav"
+
+                # skip existing model wavs if present in existing manifest (so reruns add only new models)
+                already_done = False
+                if existing_manifest is not None:
+                    try:
+                        # match by sample number and label
+                        row_sel = existing_manifest[(existing_manifest['sample'] == i) & (existing_manifest['label'] == label)]
+                        if not row_sel.empty and Path(row_sel.iloc[0]['model_wav']).exists():
+                            already_done = True
+                    except Exception:
+                        already_done = False
+                if already_done and not args.force:
+                    print(f"Skipping existing model {label} for sample {i}")
+                    continue
+                if already_done and args.force:
+                    # remove existing file so we overwrite
+                    try:
+                        Path(existing_manifest.loc[(existing_manifest['sample'] == i) & (existing_manifest['label'] == label), 'model_wav'].values[0]).unlink()
+                    except Exception:
+                        pass
+
+                if args.speaker_mode == "same_pair":
+                    synth_kwargs = {"speaker": pair_speaker} if pair_speaker is not None else {}
+                else:
+                    synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
+
+                try:
+                    tts.synthesize_to_file(tts_text, str(model_wav), **synth_kwargs)
+                except Exception as exc:
+                    # try a more aggressive sanitize fallback
+                    tts_text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", tts_text)
+                    tts.synthesize_to_file(tts_text2, str(model_wav), **synth_kwargs)
+
+                # record row in manifest (after synth, regardless of fallback)
+                manifest.append({
+                    "sample": i,
+                    "conv": rec.get("conv"),
+                    "id": rec.get("id"),
+                    "model_key": spec.get("model_key"),
+                    "label": label,
+                    "prompt": spec.get("prompt"),
+                    "shot": spec.get("shot"),
+                    "shot_k": spec.get("shot_k"),
+                    "context_mode": spec.get("context_mode"),
+                    "decoding": spec.get("decoding"),
+                    "model_text": pred_text,
+                    "model_wav": str(model_wav),
+                    "reference_wav": str(ref_wav),
+                    "fluent": rec.get("fluent"),
+                    "reference_text": rec.get("disfluent"),
+                    "tts_backend": tts_backend,
+                })
+
+        df_new = pd.DataFrame(manifest)
+        if existing_manifest is not None and not args.force:
             try:
-                tts.synthesize_to_file(tts_text, str(model_wav), **synth_kwargs)
-            except Exception as exc:
-                # try a more aggressive sanitize fallback
-                tts_text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", tts_text)
-                tts.synthesize_to_file(tts_text2, str(model_wav), **synth_kwargs)
-
-            # record row in manifest (after synth, regardless of fallback)
-            manifest.append({
-                "sample": i,
-                "conv": rec.get("conv"),
-                "id": rec.get("id"),
-                "model_key": spec.get("model_key"),
-                "label": label,
-                "prompt": spec.get("prompt"),
-                "shot": spec.get("shot"),
-                "shot_k": spec.get("shot_k"),
-                "context_mode": spec.get("context_mode"),
-                "decoding": spec.get("decoding"),
-                "model_text": pred_text,
-                "model_wav": str(model_wav),
-                "reference_wav": str(ref_wav),
-                "fluent": rec.get("fluent"),
-                "reference_text": rec.get("disfluent"),
-            })
-
-    df_new = pd.DataFrame(manifest)
-    if existing_manifest is not None and not args.force:
-        try:
-            df_combined = pd.concat([existing_manifest, df_new], ignore_index=True)
-            df_combined = df_combined.drop_duplicates(subset=["sample", "label"], keep="first")
-            df_combined.to_csv(out_dir / "manifest.csv", index=False)
-            print(f"Appended {len(df_combined) - len(existing_manifest)} new rows -> {out_dir / 'manifest.csv'}")
-        except Exception:
-            df_new.to_csv(out_dir / "manifest.csv", index=False)
-            print(f"Wrote {len(df_new)} rows -> {out_dir / 'manifest.csv'}")
-    else:
-        # overwrite or no existing manifest
-        df_new.to_csv(out_dir / "manifest.csv", index=False)
-        print(f"Wrote {len(df_new)} rows -> {out_dir / 'manifest.csv'}")
+                df_combined = pd.concat([existing_manifest, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=["sample", "label"], keep="first")
+                df_combined.to_csv(existing_manifest_path, index=False)
+                print(f"Appended {len(df_combined) - len(existing_manifest)} new rows -> {existing_manifest_path}")
+            except Exception:
+                df_new.to_csv(existing_manifest_path, index=False)
+                print(f"Wrote {len(df_new)} rows -> {existing_manifest_path}")
+        else:
+            # overwrite or no existing manifest
+            df_new.to_csv(existing_manifest_path, index=False)
+            print(f"Wrote {len(df_new)} rows -> {existing_manifest_path}")
 
 
 if __name__ == "__main__":
