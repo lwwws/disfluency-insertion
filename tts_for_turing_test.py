@@ -192,12 +192,118 @@ def load_predictions_map(pred_paths: List[Path], specs: List[Dict]) -> Dict[str,
     return mapping
 
 
-def select_examples(test_records: List[Dict], n: int, seed: int = 42):
-    candidates = [r for r in test_records if r.get("disfluent") and r.get("n_tokens_fluent", 0) >= 8 and r.get("n_tokens_fluent", 0) <= 25]
-    if not candidates:
-        raise RuntimeError("No suitable test records found in the split. Run the dataset builder / ensure splits exist.")
-    random.Random(seed).shuffle(candidates)
-    return candidates[:min(n, len(candidates))]
+def has_only_final_sil(disfluent_text: str, fluent_text: str) -> bool:
+    """Check if the only disfluency is a single <sil> token at the end.
+    
+    Returns True if disfluent text with final <sil> removed matches fluent text.
+    Examples:
+      - has_only_final_sil("<sil>", "") -> True
+      - has_only_final_sil("the dog <sil>", "the dog") -> True
+      - has_only_final_sil("the <sil> dog", "the dog") -> False (sil not at end)
+    """
+    if not disfluent_text:
+        return False
+    
+    disfluent_text = disfluent_text.strip()
+    fluent_text = fluent_text.strip() if fluent_text else ""
+    
+    # Check if disfluent ends with <sil> and removing it matches fluent
+    if disfluent_text.endswith("<sil>"):
+        candidate = disfluent_text[:-5].strip()  # Remove "<sil>"
+        if candidate == fluent_text:
+            return True
+    
+    return False
+
+
+def select_examples_with_filtering(
+        test_records: List[Dict],
+        preds_map: Dict[str, Dict],
+        target_n: int = 10,
+        initial_seed: int = 42,
+        max_retries: int = 10
+) -> tuple[List[Dict], int]:
+    """Select N samples with filtering:
+    - Exclude samples where disfluent text is only a final <sil> token
+    - Exclude samples where any model output exactly matches the disfluent reference
+    - Exclude samples where ALL models generate the same output (ignoring trailing <sil>)
+    - If < target_n samples pass filtering, resample with new seed
+    - If > target_n samples pass filtering, randomly select target_n
+
+    Returns: (selected_samples, seed_used)
+    """
+    for attempt in range(max_retries):
+        seed = initial_seed + attempt
+        rng = random.Random(seed)
+
+        # Basic filtering: valid disfluent text, token count, and not only final <sil>
+        candidates = [
+            r for r in test_records
+            if (r.get("disfluent") and
+                r.get("n_tokens_fluent", 0) >= 8 and
+                r.get("n_tokens_fluent", 0) <= 25 and
+                not has_only_final_sil(r.get("disfluent", ""), r.get("fluent", "")))
+        ]
+
+        if not candidates:
+            raise RuntimeError(
+                "No suitable test records found in the split. Run the dataset builder / ensure splits exist.")
+
+        # Shuffle and take first 25
+        rng.shuffle(candidates)
+        candidate_pool = candidates[:min(25, len(candidates))]
+
+        # Filter out samples where any model output matches the disfluent reference
+        # OR where all models produce the exact same text
+        filtered_samples = []
+        for rec in candidate_pool:
+            reference_disfluent = rec.get("disfluent", "").strip()
+            has_matching_model = False
+            normalized_preds = set()
+
+            # Check model outputs
+            for label, entry in preds_map.items():
+                sidx = rec.get("source_index")
+                rid = rec.get("id")
+                row = None
+
+                if sidx is not None and int(sidx) in entry["by_index"]:
+                    row = entry["by_index"].get(int(sidx))
+                elif rid is not None and str(rid) in entry["by_id"]:
+                    row = entry["by_id"].get(str(rid))
+
+                if row:
+                    pred_text = row.get("prediction") or (row.get("predictions") and row.get("predictions")[0]) or ""
+
+                    # 1. Check if it matches the exact human reference
+                    if pred_text.strip() == reference_disfluent:
+                        has_matching_model = True
+                        break
+
+                    # 2. Normalize by removing trailing <sil> tokens to check for model diversity
+                    norm_text = pred_text.strip()
+                    while norm_text.endswith("<sil>"):
+                        norm_text = norm_text[:-5].strip()
+                    normalized_preds.add(norm_text)
+
+            # We want samples where NO model matched the reference EXACTLY
+            # AND we have at least 2 distinct normalized predictions (unless only 1 model is being evaluated)
+            is_diverse = len(normalized_preds) > 1 if len(preds_map) > 1 else True
+
+            if not has_matching_model and is_diverse:
+                filtered_samples.append(rec)
+
+        # Check result and decide whether to continue or retry
+        if len(filtered_samples) >= target_n:
+            # More than enough samples: randomly select target_n
+            final_samples = rng.sample(filtered_samples, target_n)
+            return final_samples, seed
+
+    # If we exhaust retries with < target_n, return what we have
+    raise RuntimeError(
+        f"Could not find {target_n} valid samples after {max_retries} retries with different seeds. "
+        f"Best attempt had {len(filtered_samples)} samples."
+    )
 
 
 def main():
@@ -244,8 +350,6 @@ def main():
         if "id" not in r:
             r["id"] = idx
 
-    picked = select_examples(test_records, args.num_samples, seed=args.seed)
-
     # Build model specs (prefer --model-specs, fallback to legacy --models)
     specs_raw: List[str] = args.model_specs if args.model_specs else (args.models or [])
     if not specs_raw:
@@ -278,6 +382,24 @@ def main():
 
     pred_files = find_prediction_files(roots, suffixes)
     preds_map = load_predictions_map(pred_files, expanded_specs)
+
+    # NOW select samples with filtering (requires preds_map)
+    picked, seed_used = select_examples_with_filtering(
+        test_records, 
+        preds_map,
+        target_n=args.num_samples,
+        initial_seed=args.seed
+    )
+    print(f"Selected {len(picked)} samples using seed {seed_used}")
+
+    # Save seed to output directory
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seed_info_path = out_dir / "seed_info.json"
+    try:
+        seed_info_path.write_text(json.dumps({"seed": seed_used, "num_samples": len(picked)}), encoding="utf-8")
+    except Exception:
+        pass
 
     # TTS setup (lazy import to avoid pulling heavy ML deps when not needed)
     from utils.TTS import get_tts, prepare_text_for_tts
@@ -364,10 +486,19 @@ def main():
                 text = prepare_text_for_tts(rec.get("disfluent", ""), tts_backend)
                 text = sanitize_for_tts(text)
                 ref_wav = sample_dir / "reference_disfluent.wav"
+
+                # Unlink the existing reference file if --force is used
+                if args.force and ref_wav.exists():
+                    try:
+                        ref_wav.unlink()
+                    except Exception:
+                        pass
+
                 if args.speaker_mode == "same_pair":
                     synth_kwargs = {"speaker": pair_speaker} if pair_speaker is not None else {}
                 else:
-                    synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
+                    synth_kwargs = {
+                        "speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
                 try:
                     if not ref_wav.exists():
                         tts.synthesize_to_file(text, str(ref_wav), **synth_kwargs)
