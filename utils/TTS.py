@@ -276,8 +276,24 @@ class ChatTTS(BaseTTS):
             raise ImportError("ChatTTS and numpy are required")
 
         speaker = kwargs.pop("speaker", None) or kwargs.pop("spk_emb", None)
-        if speaker is not None and "params_infer_code" not in kwargs:
-            kwargs["params_infer_code"] = self._chat_module.Chat.InferCodeParams(spk_emb=speaker)
+
+        # 1. Lower the temperature of the acoustic model to reduce hallucinations
+        if "params_infer_code" not in kwargs:
+            kwargs["params_infer_code"] = self._chat_module.Chat.InferCodeParams(
+                spk_emb=speaker,
+                temperature=0.1  # Default is 0.3; 0.1 locks down random noises
+            )
+
+        # 2. Explicitly zero out the control tags in the refinement stage
+        kwargs["skip_refine_text"] = False
+        if "params_refine_text" not in kwargs:
+            kwargs["params_refine_text"] = self._chat_module.Chat.RefineTextParams(
+                prompt="[oral_0][laugh_0][break_0]"
+            )
+
+        # 3. Disable normalization so it doesn't alter your exact script
+        kwargs.setdefault("do_text_normalization", False)
+        kwargs.setdefault("do_homophone_replacement", False)
 
         text = prepare_text_for_tts(text, "chattts")
         wavs = self.chat.infer([text], **kwargs)
