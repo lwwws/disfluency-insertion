@@ -333,7 +333,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load canonical test split (from llm_runs_enriched by default) without importing evaluate
-    splits_dir = Path("outputs/llm_runs_enriched") / "splits"
+    splits_dir = Path("../outputs/llm_runs_enriched") / "splits"
     test_path = splits_dir / "test.jsonl"
     if not test_path.exists():
         raise FileNotFoundError(f"Test split not found at {test_path}. Run llm_training.py to create it.")
