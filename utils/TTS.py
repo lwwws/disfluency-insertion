@@ -134,6 +134,85 @@ def prepare_text_for_tts(text: str, backend: str = "chattts") -> str:
     return cleaned.replace("<sil>", "...")
 
 
+def sanitize_for_tts(text: str, keep_cutoffs: bool = False) -> str:
+    """Strip characters some TTS backends choke on, preserving ``<sil>`` markers.
+
+    This is the sanitizer used for the Turing-test stimuli (lifted out of
+    ``turing_test/tts_for_turing_test.py`` so both pipelines share one copy).
+
+    ``keep_cutoffs=False`` reproduces that behaviour exactly, INCLUDING the fact
+    that it deletes token-final hyphens - which is Switchboard's cut-off marker,
+    so ``innova-`` is read aloud as ``innova``. Pass ``keep_cutoffs=True`` to
+    preserve speech-error disfluencies; only do so if you are willing to have
+    stimuli that differ from the Turing test.
+    """
+    import re
+
+    if not text:
+        return ""
+    placeholder = "__SIL__"
+    txt = str(text).replace("<sil>", placeholder)
+    txt = " ".join(txt.split())
+    txt = txt.replace("'", "").replace("’", "")
+    if not keep_cutoffs:
+        txt = re.sub(r"(\w)-(?=\s|$)", r"\1", txt)
+        txt = re.sub(r"(?<=\s)-(?=\w)", "", txt)
+    txt = re.sub(r"[\t\r\n]+", " ", txt)
+    return txt.replace(placeholder, "<sil>")
+
+
+def build_tts_text(text: str, backend: str = "chattts", *, keep_cutoffs: bool = False,
+                   lbreak: bool = False) -> str:
+    """The exact string handed to the backend: prepared, sanitized, optionally padded.
+
+    Split out from ``synthesize_utterance`` so callers can hash what will ACTUALLY
+    be spoken. Caching on the upstream text instead silently serves stale audio
+    when a flag like ``lbreak`` or ``keep_cutoffs`` changes the rendered string.
+    """
+    out = sanitize_for_tts(prepare_text_for_tts(text, backend), keep_cutoffs=keep_cutoffs)
+    if lbreak and "chattts" in backend.lower():
+        out = out.rstrip() + " [lbreak]"
+    return out
+
+
+def synthesize_utterance(tts: "BaseTTS", text: str, path: str, *, backend: str = "chattts",
+                         speaker: Optional[str] = None, keep_cutoffs: bool = False,
+                         lbreak: bool = False, preserve_tags: bool = True,
+                         **synth_kwargs: Any) -> str:
+    """Render one utterance to ``path``: prepare -> sanitize -> synthesize.
+
+    The single implementation of the synthesis step, shared by
+    ``turing_test/tts_for_turing_test.py`` and ``conv_tts.py`` so stimuli from
+    the two studies are produced identically.
+
+    On backend failure it retries with a coarser scrub.
+
+    ``preserve_tags`` controls that retry. ``True`` keeps ``[...]`` control tags,
+    so ``[uv_break]`` still renders as a pause. ``False`` reproduces the original
+    inline fallback in ``tts_for_turing_test.py`` byte-for-byte - INCLUDING its
+    bug, where stripping the brackets makes ChatTTS speak "uv break" aloud. The
+    Turing-test script passes ``False`` so its already-collected stimuli stay
+    exactly reproducible; new work should leave it ``True``.
+    """
+    import re
+
+    tts_text = build_tts_text(text, backend, keep_cutoffs=keep_cutoffs, lbreak=lbreak)
+
+    kwargs = dict(synth_kwargs)
+    if speaker is not None:
+        kwargs["speaker"] = speaker
+    try:
+        tts.synthesize_to_file(tts_text, str(path), **kwargs)
+    except Exception as exc:
+        if preserve_tags:
+            fallback = " ".join(re.sub(r"[^\w\s<>\[\]\.\,\?\!]+", " ", tts_text).split())
+        else:  # verbatim HEAD behaviour: brackets are stripped, no whitespace collapse
+            fallback = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", tts_text)
+        print(f"  ! TTS failed on {text!r} ({exc}); retrying with {fallback!r}")
+        tts.synthesize_to_file(fallback, str(path), **kwargs)
+    return str(path)
+
+
 class BarkTTS(BaseTTS):
     def __init__(self, model_key: str, model_id: Optional[str] = None, device: Optional[str] = None):
         super().__init__(model_key, model_id, device)
@@ -254,22 +333,56 @@ class ParlerTTS(BaseTTS):
 
 
 class ChatTTS(BaseTTS):
-    def __init__(self, model_key: str, model_id: Optional[str] = None, device: Optional[str] = None):
+    def __init__(self, model_key: str, model_id: Optional[str] = None,
+                 device: Optional[str] = None, source: str = "huggingface"):
         super().__init__(model_key, model_id, device)
         self.chat = None
         self._chat_module = None
+
         try:
             import ChatTTS as _ChatTTS
-            self._chat_module = _ChatTTS
-            self.chat = _ChatTTS.Chat()
-            self.chat.load(compile=False)
-        except ImportError:
-            pass
+        except ImportError as exc:
+            raise ImportError(
+                "ChatTTS is not installed in this environment. Install it with:\n"
+                "    pip install ChatTTS"
+            ) from exc
+
+        self._chat_module = _ChatTTS
+        chat = _ChatTTS.Chat()
+
+        # source="huggingface" resolves weights through the standard HF cache.
+        # The library's own default ("local") uses a bundled downloader that
+        # writes into ./asset and reports a bare 'no dns available' on some
+        # networks even when huggingface.co is perfectly reachable.
+        #
+        # load() RETURNS False on failure rather than raising; ignoring that
+        # leaves a half-built Chat whose first real call dies with a confusing
+        # AttributeError, so check it here.
+        if not chat.load(source=source, compile=False):
+            raise RuntimeError(
+                f"ChatTTS.load(source={source!r}) failed - model weights are missing "
+                f"or could not be fetched.\n"
+                f"The weights normally live in the HF cache under "
+                f"models--2Noise--ChatTTS. Try source='local' to download into "
+                f"./asset instead, or pre-fetch with:\n"
+                f"    huggingface-cli download 2Noise/ChatTTS"
+            )
+        self.chat = chat
 
     def sample_speaker(self) -> Optional[str]:
         if self.chat is None:
             raise ImportError("ChatTTS is required to sample a speaker")
         return self.chat.sample_random_speaker()
+
+    def sample_audio_speaker(self, audio: "_np.ndarray") -> str:
+        """Encode a rendered waveform into a ``spk_smp`` reference token.
+
+        Pass the result back as ``spk_smp`` (with the matching text as
+        ``txt_smp``) to keep a voice stable across separate synthesis calls.
+        """
+        if self.chat is None:
+            raise ImportError("ChatTTS is required to sample an audio speaker")
+        return self.chat.sample_audio_speaker(audio)
 
     def synthesize(self, text: str, **kwargs: Any) -> Tuple["_np.ndarray", int]:
         if self.chat is None or _np is None:
@@ -277,10 +390,17 @@ class ChatTTS(BaseTTS):
 
         speaker = kwargs.pop("speaker", None) or kwargs.pop("spk_emb", None)
 
+        spk_smp = kwargs.pop("spk_smp", None)
+        txt_smp = kwargs.pop("txt_smp", None)
+        manual_seed = kwargs.pop("manual_seed", None)
+
         # 1. Lower the temperature of the acoustic model to reduce hallucinations
         if "params_infer_code" not in kwargs:
             kwargs["params_infer_code"] = self._chat_module.Chat.InferCodeParams(
                 spk_emb=speaker,
+                spk_smp=spk_smp,
+                txt_smp=txt_smp,
+                manual_seed=manual_seed,
                 temperature=0.1  # Default is 0.3; 0.1 locks down random noises
             )
 

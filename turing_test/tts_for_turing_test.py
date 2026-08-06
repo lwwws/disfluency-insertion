@@ -26,30 +26,12 @@ import pandas as pd
 # Avoid importing utils.TTS at module import time to prevent heavy HF/torch model loads.
 # The factory (get_tts) will be imported lazily inside main().
 
-# Utility: sanitize text for TTS backends (remove problematic characters while preserving <sil>)
-import re
-
-def sanitize_for_tts(text: str) -> str:
-    """Sanitize text before sending to TTS backends.
-    Preserves <sil> tokens but removes stray apostrophes and internal hyphens that some backends reject.
-    """
-    if not text:
-        return ""
-    # preserve <sil> markers by temporarily replacing them
-    placeholder = "__SIL__"
-    txt = text.replace("<sil>", placeholder)
-    # normalize whitespace
-    txt = " ".join(txt.split())
-    # remove straight and curly apostrophes
-    txt = txt.replace("'", "").replace("'", "")
-    # remove hyphens that occur at token edges (e.g., st- or -member)
-    txt = re.sub(r"(\w)-(?=\s|$)", r"\1", txt)
-    txt = re.sub(r"(?<=\s)-(?=\w)", "", txt)
-    # collapse repeated punctuation that some backends dislike
-    txt = re.sub(r"[\t\r\n]+", " ", txt)
-    # restore <sil>
-    txt = txt.replace(placeholder, "<sil>")
-    return txt
+# Text prep and synthesis live in utils.TTS (synthesize_utterance), and the
+# "did the model insert anything" predicate in utils.text_norm - both shared with
+# the conversation pipeline (conv_tts.py) so the two studies produce stimuli
+# identically. utils.text_norm is a light import; the heavy get_tts factory is
+# still imported lazily inside main().
+from utils.text_norm import has_only_final_sil
 
 # Avoid importing evaluate.py to prevent heavy HF/torch model loads and downloads.
 # Load the canonical test split JSONL directly when needed.
@@ -190,30 +172,6 @@ def load_predictions_map(pred_paths: List[Path], specs: List[Dict]) -> Dict[str,
         except Exception:
             continue
     return mapping
-
-
-def has_only_final_sil(disfluent_text: str, fluent_text: str) -> bool:
-    """Check if the only disfluency is a single <sil> token at the end.
-    
-    Returns True if disfluent text with final <sil> removed matches fluent text.
-    Examples:
-      - has_only_final_sil("<sil>", "") -> True
-      - has_only_final_sil("the dog <sil>", "the dog") -> True
-      - has_only_final_sil("the <sil> dog", "the dog") -> False (sil not at end)
-    """
-    if not disfluent_text:
-        return False
-    
-    disfluent_text = disfluent_text.strip()
-    fluent_text = fluent_text.strip() if fluent_text else ""
-    
-    # Check if disfluent ends with <sil> and removing it matches fluent
-    if disfluent_text.endswith("<sil>"):
-        candidate = disfluent_text[:-5].strip()  # Remove "<sil>"
-        if candidate == fluent_text:
-            return True
-    
-    return False
 
 
 def select_examples_with_filtering(
@@ -402,7 +360,7 @@ def main():
         pass
 
     # TTS setup (lazy import to avoid pulling heavy ML deps when not needed)
-    from utils.TTS import get_tts, prepare_text_for_tts
+    from utils.TTS import get_tts, synthesize_utterance
 
     # Loop over each TTS backend and generate audio
     for tts_backend in args.tts_backends:
@@ -483,8 +441,7 @@ def main():
 
             if ref_wav is None:
                 # Synthesize the reference disfluent text
-                text = prepare_text_for_tts(rec.get("disfluent", ""), tts_backend)
-                text = sanitize_for_tts(text)
+                text = rec.get("disfluent", "")
                 ref_wav = sample_dir / "reference_disfluent.wav"
 
                 # Unlink the existing reference file if --force is used
@@ -499,13 +456,12 @@ def main():
                 else:
                     synth_kwargs = {
                         "speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
-                try:
-                    if not ref_wav.exists():
-                        tts.synthesize_to_file(text, str(ref_wav), **synth_kwargs)
-                except Exception as exc:
-                    # fallback: try again with more aggressive sanitization
-                    text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", text)
-                    tts.synthesize_to_file(text2, str(ref_wav), **synth_kwargs)
+                if not ref_wav.exists():
+                    # preserve_tags=False keeps this script's error-path behaviour
+                    # byte-identical to the run that produced the collected stimuli.
+                    synthesize_utterance(tts, text, ref_wav, backend=tts_backend,
+                                         speaker=synth_kwargs.get("speaker"),
+                                         preserve_tags=False)
 
             # For each requested spec, synthesize its prediction (if available)
             for label, entry in preds_map.items():
@@ -527,8 +483,6 @@ def main():
                     continue
 
                 pred_text = row.get("prediction") or (row.get("predictions") and row.get("predictions")[0]) or ""
-                tts_text = prepare_text_for_tts(pred_text, tts_backend)
-                tts_text = sanitize_for_tts(tts_text)
                 safe_label = label.replace("/", "_").replace(" ", "_")
                 model_wav = sample_dir / f"model_{safe_label}.wav"
 
@@ -557,12 +511,9 @@ def main():
                 else:
                     synth_kwargs = {"speaker": shared_speaker} if args.speaker_mode == "same_all" and shared_speaker is not None else {}
 
-                try:
-                    tts.synthesize_to_file(tts_text, str(model_wav), **synth_kwargs)
-                except Exception as exc:
-                    # try a more aggressive sanitize fallback
-                    tts_text2 = re.sub(r"[^\w\s<>\.\,\?\!]+", " ", tts_text)
-                    tts.synthesize_to_file(tts_text2, str(model_wav), **synth_kwargs)
+                synthesize_utterance(tts, pred_text, model_wav, backend=tts_backend,
+                                     speaker=synth_kwargs.get("speaker"),
+                                     preserve_tags=False)
 
                 # record row in manifest (after synth, regardless of fallback)
                 manifest.append({
