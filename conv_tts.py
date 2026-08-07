@@ -162,6 +162,13 @@ def main() -> None:
     ap.add_argument("--resample-voices", action="store_true",
                     help="Ignore _speakers.json and draw fresh voices. Combine with "
                          "--voice-seed to hunt for a pair you like.")
+    ap.add_argument("--infer-temperature", type=float, default=None,
+                    help="ChatTTS acoustic-model sampling temperature. Omit to keep the "
+                         "0.1 default, which is what every clip so far was rendered at. ")
+    ap.add_argument("--swap-voices", action="store_true",
+                    help="Give each speaker the next speaker's voice - for the usual two "
+                         "speakers, A and B trade. Writes to a separate '<backend>_voiceswap' "
+                         "tree, so the unswapped version stays on disk alongside it.")
     ap.add_argument("--force", action="store_true", help="Re-synthesize cached turn audio")
     args = ap.parse_args()
 
@@ -173,7 +180,7 @@ def main() -> None:
         if model_key and model_key not in preds:
             raise SystemExit(f"No predictions for {model_key}. Have: {sorted(preds)}")
 
-    out_root = Path(args.output_dir) / args.backend
+    out_root = Path(args.output_dir) / (args.backend + ("_voiceswap" if args.swap_voices else ""))
     turns_dir = out_root / "turns"
     turns_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,25 +191,37 @@ def main() -> None:
     # One voice per speaker label, persisted so every condition, model and rerun
     # uses the same two voices - otherwise voice becomes a confound.
     speakers_path = out_root / "_speakers.json"
-    voices: Dict[str, str] = {}
+    pool: Dict[str, str] = {}
     prev_seed = None
     if speakers_path.exists() and not args.resample_voices:
         stored = json.loads(speakers_path.read_text(encoding="utf-8"))
         # {"voice_seed": N, "voices": {...}}; tolerate the older flat {label: emb}
         if isinstance(stored.get("voices"), dict):
-            voices, prev_seed = stored["voices"], stored.get("voice_seed")
+            pool, prev_seed = stored["voices"], stored.get("voice_seed")
         else:
-            voices = stored
+            pool = stored
+
+    speakers = sorted({r["speaker"] for r in clean.values()})
 
     drawn: List[str] = []
-    for speaker in sorted({r["speaker"] for r in clean.values()}):
-        if speaker in voices:
+    for speaker in speakers:
+        if speaker in pool:
             continue
         if args.voice_seed is not None:
             import torch  # ChatTTS samples speakers via the global torch RNG
             torch.manual_seed(voice_seed_for(args.voice_seed, speaker))
-        voices[speaker] = tts.sample_speaker()
+        pool[speaker] = tts.sample_speaker()
         drawn.append(speaker)
+
+    # ``pool`` is the voice bank, always keyed by the label the voice was drawn
+    # for; ``voice_of`` says who actually speaks with it. Keeping the two apart
+    # means --swap-voices reuses the very same embeddings, just reassigned, so
+    # the swapped run differs from the plain one in nothing but the pairing.
+    if args.swap_voices:
+        voice_of = {s: speakers[(i + 1) % len(speakers)] for i, s in enumerate(speakers)}
+    else:
+        voice_of = {s: s for s in speakers}
+    voices = {s: pool[src] for s, src in voice_of.items()}
 
     # NOTE: do NOT try to stabilise the voice with spk_smp/txt_smp. ChatTTS decodes
     # spk_smp as an AUDIO PROMPT and continues from it, and only ever uses it where
@@ -211,35 +230,49 @@ def main() -> None:
     # which comes out raspy and wrong. spk_emb alone is the supported way.
     seed_used = args.voice_seed if args.voice_seed is not None else prev_seed
     speakers_path.write_text(json.dumps(
-        {"voice_seed": seed_used, "voices": voices}, indent=2), encoding="utf-8")
-    reused = sorted(set(voices) - set(drawn))
+        {"voice_seed": seed_used, "swapped": args.swap_voices,
+         "assignment": voice_of, "voices": pool}, indent=2), encoding="utf-8")
+    reused = sorted(set(pool) - set(drawn))
     print(f"Voices -> {speakers_path}")
     if drawn:
         print(f"  drawn : {', '.join(sorted(drawn))}"
               + (f" (seed {args.voice_seed})" if args.voice_seed is not None else " (unseeded)"))
     if reused:
         print(f"  reused: {', '.join(reused)}")
+    if args.swap_voices:
+        print("  SWAPPED: " + ", ".join(f"{s} speaks with {src}'s voice"
+                                        for s, src in sorted(voice_of.items())))
+    if args.infer_temperature is not None:
+        print(f"  infer temperature: {args.infer_temperature} (default 0.1)")
 
     def synth_turn(conv: str, turn: int, variant: str, speaker: str, text: str) -> Path:
         """Synthesize one turn (cached). ``variant`` is 'fluent' or the model key.
 
-        The filename carries a hash of the exact text AND the speaker embedding,
-        so hand-editing a prediction or changing a voice produces a new cache key
-        and re-synthesizes, while untouched turns are still reused.
+        The filename carries a hash of the exact text, the speaker embedding AND
+        the sampling temperature, so hand-editing a prediction, changing a voice
+        or changing the temperature produces a new cache key and re-synthesizes,
+        while untouched turns are still reused. The temperature is only mixed in
+        when set, so the default keeps the keys already on disk valid.
         """
         # Hash the string that will actually be SPOKEN (so --lbreak / --keep-cutoffs
         # invalidate too), plus the voice.
         spoken = build_tts_text(text, args.backend, keep_cutoffs=args.keep_cutoffs,
                                 lbreak=args.lbreak)
         key = f"{spoken}\x00{voices.get(speaker, '')}"
+        if args.infer_temperature is not None:
+            key += f"\x00t{args.infer_temperature}"
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
         wav = turns_dir / conv / f"t{turn:02d}_{variant.replace('/', '_')}_{digest}.wav"
         wav.parent.mkdir(parents=True, exist_ok=True)
         if wav.exists() and not args.force:
             return wav
+        extra = {}
+        # Only ChatTTS takes it; other backends would reject the kwarg.
+        if args.infer_temperature is not None and args.backend == "chattts":
+            extra["infer_temperature"] = args.infer_temperature
         synthesize_utterance(tts, text, wav, backend=args.backend,
                              speaker=voices.get(speaker),
-                             keep_cutoffs=args.keep_cutoffs, lbreak=args.lbreak)
+                             keep_cutoffs=args.keep_cutoffs, lbreak=args.lbreak, **extra)
         return wav
 
     convs = sorted({conv for conv, _ in clean})
@@ -280,6 +313,7 @@ def main() -> None:
 
                 manifest.append({
                     "condition": label, "conv": conv, "turn": turn, "speaker": speaker,
+                    "voice": voice_of.get(speaker, speaker), "voice_swapped": args.swap_voices,
                     "disfluent": disfluent, "variant": variant,
                     "model_key": model_key, "text": text,
                     "turn_wav": str(wav), "clip_wav": str(clip_dir / f"{conv}.wav"),

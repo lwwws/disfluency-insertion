@@ -393,6 +393,9 @@ class ChatTTS(BaseTTS):
         spk_smp = kwargs.pop("spk_smp", None)
         txt_smp = kwargs.pop("txt_smp", None)
         manual_seed = kwargs.pop("manual_seed", None)
+        infer_temperature = kwargs.pop("infer_temperature", None)
+        if infer_temperature is None:
+            infer_temperature = 0.1
 
         # 1. Lower the temperature of the acoustic model to reduce hallucinations
         if "params_infer_code" not in kwargs:
@@ -401,7 +404,7 @@ class ChatTTS(BaseTTS):
                 spk_smp=spk_smp,
                 txt_smp=txt_smp,
                 manual_seed=manual_seed,
-                temperature=0.1  # Default is 0.3; 0.1 locks down random noises
+                temperature=infer_temperature,
             )
 
         # 2. Explicitly zero out the control tags in the refinement stage
